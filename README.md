@@ -26,13 +26,19 @@ For OpenShift clusters with VM healing enabled, it also monitors node health
 and can automatically drain and delete failing nodes, allowing the machine
 controller to recreate them.
 
-**NEW**: It now also monitors VirtualMachine resources directly to detect
-and heal VMs stuck in ErrorUnschedulable, Error, or stuck Provisioning states.
+**NEW**: It now also monitors VirtualMachine resources directly. VMs are only deleted
+if they exist for more than 6 minutes (allowing tests to self-cleanup). VMs in
+ErrorUnschedulable state are cleaned up after 3 minutes to handle scheduling failures
+faster while still allowing time for recovery.
 
 **NEW**: CRD cleanup mode allows the tool to act as a janitor for test environments,
 automatically cleaning up stale CRD resources that are stuck, in error states, or
 older than a configurable threshold. This is particularly useful when running tests
 in parallel, as it ensures the cluster stays clean and tests can run smoothly.
+
+**NEW**: Resource creation throttling warns when resources are created during cluster
+strain, helping prevent further resource pressure. Test namespace resources are allowed
+but logged with guidance, while non-test resources receive stronger warnings.
 
 The tool is designed to be lightweight, safe, and extensible ---
 suitable for both local development, test environments, and production environments.
@@ -54,6 +60,9 @@ suitable for both local development, test environments, and production environme
     strain by detecting cluster-wide resource pressure and evicting resource-constrained
     pods (OOMKilled, high restart count, stuck in Pending). Helps keep clusters healthy
     during heavy test workloads.\
+-   **Resource Creation Throttling (🆕):** Monitors and warns when resources are created
+    during cluster strain, helping prevent further resource pressure. Provides actionable
+    guidance to operators about deferring non-critical resource creation.\
 -   **Healing Cooldown (🆕):** Prevents repeated healing loops by
     skipping Pods recently healed within a configurable cooldown period
     (default: **10 minutes**).\
@@ -100,8 +109,10 @@ suitable for both local development, test environments, and production environme
     states that persist beyond configurable thresholds.
 
 2.  **VirtualMachine Detection:**\
-    Monitors VirtualMachine resources for `ErrorUnschedulable`, `Error`, or
-    stuck `Provisioning` states that persist beyond thresholds.
+    Monitors VirtualMachine resources for health issues. VMs are only deleted if:
+    - They are older than 6 minutes (regardless of health state), allowing tests to self-cleanup
+    - VMs in `ErrorUnschedulable` state are cleaned up after 3 minutes (faster cleanup for scheduling failures)
+    - Health monitoring continues for logging purposes even if deletion is deferred
 
 3.  **Pod Eviction:**\
     Before deleting a failing node, attempts to safely drain it by evicting
@@ -312,6 +323,12 @@ By default, the tool authenticates using your local **Kubeconfig** file
   `--namespace-poll-interval` How often to poll for new       `--namespace-poll-interval 30s`
                              namespaces (e.g., 30s, 1m).      
                              Default: `30s`.                  
+
+  `--enable-resource-creation-throttling` Enable resource     `--enable-resource-creation-throttling=false`
+                                          creation throttling  
+                                          warnings during      
+                                          cluster strain      
+                                          (default: enabled). 
   
 ------------------------------------------------------------------------
 
@@ -384,6 +401,12 @@ By default, the tool authenticates using your local **Kubeconfig** file
 
 # Disable resource optimization if not needed
 ./k8s-healer --enable-resource-optimization=false -n default
+
+# Resource creation throttling is enabled by default - warns when resources are created during cluster strain
+./k8s-healer --enable-resource-creation-throttling -n default
+
+# Disable resource creation throttling if not needed
+./k8s-healer --enable-resource-creation-throttling=false -n default
 
 # Run in foreground mode (non-daemon) - output goes to terminal
 ./k8s-healer -k .kubeconfigs/test-config -n default
@@ -664,6 +687,24 @@ You can specify a different source kubeconfig location using the `--source-kubec
     [SUCCESS] ✅ Evicted pod default/app-pod-1 for resource optimization
     !!! RESOURCE OPTIMIZATION ACTION COMPLETE !!!
 
+### Resource Creation Throttling
+    [INFO] ⚠️ Cluster under strain: 35.0% of nodes (2/6) under resource pressure
+    [WARN] ⚠️ New pod created in test namespace during cluster strain: test-12345/playwright-test-1 (strain: 35.0%)
+    [INFO] 💡 Consider reducing parallel test execution or waiting for cluster to recover
+    
+    [WARN] 🚨 New virtualmachine created during cluster strain: default/app-vm-1 (strain: 35.0%)
+    [INFO] 💡 Resource creation throttling active - consider deferring resource creation until cluster recovers
+    [INFO] 📊 Cluster status: 2/6 nodes under pressure: [node-1, node-2]
+
+### VM Cleanup (Age-Based)
+    [MONITOR] 🔍 VM pw-test-ns/pw-vm-customize-it-1769465109327-8aya health check: VM ErrorUnschedulable for 2m30s
+    !!! VM CLEANUP ACTION REQUIRED !!!
+        VM: pw-test-ns/pw-vm-customize-it-1769465109327-8aya
+        Age: 6m15s (threshold: 6m0s)
+        Health Status: VM ErrorUnschedulable for 2m30s (cannot be scheduled to any node)
+    [SUCCESS] ✅ Deleted VM pw-test-ns/pw-vm-customize-it-1769465109327-8aya
+    !!! VM CLEANUP ACTION COMPLETE !!!
+
 ------------------------------------------------------------------------
 
 ## 🧠 Resource Optimization Use Cases
@@ -763,6 +804,18 @@ You can easily extend **k8s-healer** by:
 - Integrating logging or Prometheus metrics for observability.
 - Adding custom healing strategies for different failure types.
 - Adding support for additional CRD resource types by extending the resource detection logic.
+
+------------------------------------------------------------------------
+
+## 🤝 Contributing
+
+We welcome contributions! Please see [CONTRIBUTING.md](./CONTRIBUTING.md) for:
+- Project evolution and design principles
+- Development patterns and guidelines
+- How features were developed and why
+- Guidelines for adding new features
+
+The contributing guide includes a summary of the prompts and decisions that shaped the project's evolution, helping new contributors understand the design philosophy.
 
 ------------------------------------------------------------------------
 
