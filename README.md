@@ -348,11 +348,11 @@ By default, the tool authenticates using your local **Kubeconfig** file
 ./k8s-healer -k /etc/k8s/admin.conf -n default
 
 # Run in FOREGROUND mode (non-daemon) - output to terminal
-./k8s-healer -k .kubeconfigs/test-config -n default
+./k8s-healer -k ~/.kube/config -n default
 # Press Ctrl+C to stop
 
 # Run in DAEMON mode (background) - output to log file
-./k8s-healer start -k .kubeconfigs/test-config -n default
+./k8s-healer start -k ~/.kube/config -n default
 # Use './k8s-healer stop' to stop
 
 # Apply a custom healing cooldown period (5 minutes)
@@ -387,7 +387,7 @@ By default, the tool authenticates using your local **Kubeconfig** file
   --enable-namespace-polling \
   --namespace-pattern "test-*" \
   --enable-resource-optimization \
-  -k .kubeconfigs/test-config \
+  -k ~/.kube/config \
   -n default
 
 # Disable CRD cleanup if needed
@@ -409,7 +409,7 @@ By default, the tool authenticates using your local **Kubeconfig** file
 ./k8s-healer --enable-resource-creation-throttling=false -n default
 
 # Run in foreground mode (non-daemon) - output goes to terminal
-./k8s-healer -k .kubeconfigs/test-config -n default
+./k8s-healer -k ~/.kube/config -n default
 
 # Run as background daemon (CRD cleanup enabled by default)
 ./k8s-healer start --crd-resources "virtualmachines.kubevirt.io/v1" -n default
@@ -442,10 +442,10 @@ Run directly in the terminal - output goes to stdout/stderr. Press `Ctrl+C` to s
 
 ```bash
 # Run in foreground mode
-./k8s-healer -k .kubeconfigs/test-config -n default
+./k8s-healer -k ~/.kube/config -n default
 
 # Or with the convenience script (without 'start' command)
-./run-healer.sh --source-kubeconfig /path/to/kubeconfig start --foreground
+./run-healer.sh --source-kubeconfig ~/.kube/config start --foreground
 ```
 
 **Use foreground mode when:**
@@ -459,7 +459,7 @@ Run as a background process - output goes to a log file. Use `stop` command to t
 
 ```bash
 # Start as daemon
-./k8s-healer start -k .kubeconfigs/test-config -n default
+./k8s-healer start -k ~/.kube/config -n default
 
 # Or with the convenience script
 ./run-healer.sh start
@@ -581,14 +581,14 @@ The script automatically:
 - Manages PID and log files in the project directory
 - Provides colored output and error handling
 
-**Note**: The kubeconfig file is copied from a source location (default: `/home/bmaio/Developer/Projects/kubevirt-ui/.kubeconfigs/test-config`) 
+**Note**: The kubeconfig file is copied from a source location (specified via `--source-kubeconfig` flag) 
 into `.kubeconfigs/test-config` in the k8s-healer project directory. If the file doesn't exist, 
 the script will attempt to copy it automatically on first run.
 
 You can specify a different source kubeconfig location using the `--source-kubeconfig` flag:
 
 ```bash
-./run-healer.sh --source-kubeconfig /path/to/your/kubeconfig start
+./run-healer.sh --source-kubeconfig ~/.kube/config start
 ```
 
 ------------------------------------------------------------------------
