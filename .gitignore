@@ -27,7 +27,18 @@ Binary output location
 
 k8s-healer
 
+Daemon files
+
+.k8s-healer.pid
+.k8s-healer.log
+
 IDE settings
 
 .idea/
 .DS_Store
+
+Kubernetes config directories
+
+.kubeconfig/
+.kubeconfigs/
+kubeconfigs/
