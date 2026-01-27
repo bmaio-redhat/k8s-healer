@@ -10,8 +10,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/daigoro86dev/k8s-healer/pkg/daemon"
-	"github.com/daigoro86dev/k8s-healer/pkg/healer"
+	"github.com/bmaio-redhat/k8s-healer/pkg/daemon"
+	"github.com/bmaio-redhat/k8s-healer/pkg/healer"
 	"github.com/spf13/cobra"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"

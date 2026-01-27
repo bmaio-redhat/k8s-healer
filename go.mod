@@ -1,4 +1,4 @@
-module github.com/daigoro86dev/k8s-healer
+module github.com/bmaio-redhat/k8s-healer
 
 go 1.24.7
 

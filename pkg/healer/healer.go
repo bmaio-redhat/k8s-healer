@@ -7,7 +7,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/daigoro86dev/k8s-healer/pkg/util"
+	"github.com/bmaio-redhat/k8s-healer/pkg/util"
 	v1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
