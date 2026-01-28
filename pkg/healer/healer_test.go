@@ -69,6 +69,8 @@ func TestHealer_DisplayClusterInfo(t *testing.T) {
 	}
 
 	// This should not panic
+	// Note: Health checks with fake clients will show degraded status for CRDs
+	// which is expected behavior - the function should handle it gracefully
 	healer.DisplayClusterInfo(config, "")
 }
 

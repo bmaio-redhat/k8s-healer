@@ -882,6 +882,7 @@ The test suite covers:
 - **Utility Functions** (`pkg/util/checks_test.go`): Tests for pod health checks, node health checks, VM health checks, CRD staleness detection, cluster strain detection, and resource optimization logic
 - **Daemon Functions** (`pkg/daemon/daemon_test.go`): Tests for PID file management, log file redirection, and daemon utilities
 - **Healer Logic** (`pkg/healer/healer_test.go`): Tests for healer initialization, cluster info display, namespace pattern matching, and resource cleanup logic
+- **Health Check System** (`pkg/healthcheck/healthcheck_test.go`): Tests for cluster health checks, KubeVirt CRD availability, API connectivity, and health status formatting
 
 ### Test Structure
 

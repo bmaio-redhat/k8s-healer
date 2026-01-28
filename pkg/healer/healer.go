@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/bmaio-redhat/k8s-healer/pkg/util"
+	"github.com/bmaio-redhat/k8s-healer/pkg/healthcheck"
 	v1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -226,6 +227,17 @@ func (h *Healer) DisplayClusterInfo(config *rest.Config, kubeconfigPath string) 
 	output("   • Stale Age Threshold: %v\n", h.StaleAge)
 	output("   • Heal Cooldown: %v\n", h.HealCooldown)
 	output("   • Cleanup Finalizers: %s\n", formatBool(h.CleanupFinalizers))
+
+	output(strings.Repeat("=", 70) + "\n")
+
+	// Perform pre-start health checks
+	output("\n🔍 Performing Pre-Start Health Checks...\n")
+	healthStatus, err := healthcheck.PerformClusterHealthCheck(h.ClientSet, h.DynamicClient, config)
+	if err != nil {
+		output("   [WARN] ⚠️ Failed to perform health checks: %v\n", err)
+	} else {
+		output(healthcheck.FormatHealthCheckStatus(healthStatus))
+	}
 
 	output(strings.Repeat("=", 70) + "\n")
 	output("\n")

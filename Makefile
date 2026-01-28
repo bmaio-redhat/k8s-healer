@@ -36,3 +36,6 @@ test-daemon:
 
 test-healer:
 	go test -v ./pkg/healer/...
+
+test-healthcheck:
+	go test -v ./pkg/healthcheck/...
