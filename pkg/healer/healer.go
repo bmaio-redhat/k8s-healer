@@ -22,11 +22,12 @@ import (
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/discovery"
+	"k8s.io/apimachinery/pkg/version"
 )
 
 // Healer holds the Kubernetes client and configuration for watching.
 type Healer struct {
-	ClientSet                  *kubernetes.Clientset
+	ClientSet                  kubernetes.Interface
 	DynamicClient              dynamic.Interface
 	Namespaces                 []string
 	StopCh                     chan struct{}
@@ -129,9 +130,18 @@ func (h *Healer) DisplayClusterInfo(config *rest.Config, kubeconfigPath string) 
 	output(strings.Repeat("=", 70) + "\n")
 
 	// Get server version
-	discoveryClient := discovery.NewDiscoveryClient(h.ClientSet.RESTClient())
-	serverVersion, err := discoveryClient.ServerVersion()
-	if err == nil {
+	// Try to get RESTClient from the clientset (works with real clientset, may fail with fake)
+	var serverVersion *version.Info
+	var err error
+	if realClientset, ok := h.ClientSet.(*kubernetes.Clientset); ok {
+		discoveryClient := discovery.NewDiscoveryClient(realClientset.RESTClient())
+		serverVersion, err = discoveryClient.ServerVersion()
+	} else {
+		// For fake clientset in tests, skip version check
+		err = fmt.Errorf("cannot get server version from fake clientset")
+	}
+	
+	if err == nil && serverVersion != nil {
 		output("📦 Kubernetes Version: %s\n", serverVersion.GitVersion)
 		output("   Platform: %s/%s\n", serverVersion.Platform, serverVersion.GoVersion)
 	} else {
@@ -1187,6 +1197,11 @@ func (h *Healer) isTestNamespace(namespace string) bool {
 		if err == nil && matched {
 			return true
 		}
+	}
+
+	// If no pattern is explicitly set, don't assume test namespaces
+	if h.NamespacePattern == "" {
+		return false
 	}
 
 	// Also check if namespace matches common test namespace patterns

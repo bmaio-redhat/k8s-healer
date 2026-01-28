@@ -853,6 +853,42 @@ You can easily extend **k8s-healer** by:
 
 ------------------------------------------------------------------------
 
+## 🧪 Testing
+
+k8s-healer includes comprehensive test coverage for core functionality:
+
+### Running Tests
+
+```bash
+# Run all tests
+go test ./pkg/...
+
+# Run tests with verbose output
+go test -v ./pkg/...
+
+# Run tests with coverage
+go test -coverprofile=coverage.out ./pkg/...
+go tool cover -html=coverage.out -o coverage.html
+
+# Or use the Makefile
+make test
+make test-verbose
+make test-coverage
+```
+
+### Test Coverage
+
+The test suite covers:
+- **Utility Functions** (`pkg/util/checks_test.go`): Tests for pod health checks, node health checks, VM health checks, CRD staleness detection, cluster strain detection, and resource optimization logic
+- **Daemon Functions** (`pkg/daemon/daemon_test.go`): Tests for PID file management, log file redirection, and daemon utilities
+- **Healer Logic** (`pkg/healer/healer_test.go`): Tests for healer initialization, cluster info display, namespace pattern matching, and resource cleanup logic
+
+### Test Structure
+
+- Unit tests use standard Go testing package
+- Kubernetes clients are mocked using `fake` clients from `k8s.io/client-go`
+- Tests are organized by package and cover both happy paths and edge cases
+
 ## 🤝 Contributing
 
 We welcome contributions! Please see [CONTRIBUTING.md](./CONTRIBUTING.md) for:
@@ -862,6 +898,11 @@ We welcome contributions! Please see [CONTRIBUTING.md](./CONTRIBUTING.md) for:
 - Guidelines for adding new features
 
 The contributing guide includes a summary of the prompts and decisions that shaped the project's evolution, helping new contributors understand the design philosophy.
+
+**Testing Requirements:**
+- All new features should include appropriate test coverage
+- Run `make test` before submitting PRs
+- Aim for at least 80% test coverage for new code
 
 ------------------------------------------------------------------------
 
