@@ -39,3 +39,6 @@ test-healer:
 
 test-healthcheck:
 	go test -v ./pkg/healthcheck/...
+
+test-discovery:
+	go test -v ./pkg/discovery/...

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/bmaio-redhat/k8s-healer/pkg/daemon"
+	"github.com/bmaio-redhat/k8s-healer/pkg/discovery"
 	"github.com/bmaio-redhat/k8s-healer/pkg/healer"
 	"github.com/spf13/cobra"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -37,6 +38,7 @@ var (
 	daemonMode                       bool
 	pidFile                          string
 	logFile                          string
+	discoverEndpoints                bool
 )
 
 // rootCmd represents the base command when called without any subcommands
@@ -109,6 +111,8 @@ func init() {
 		"Path to the PID file when running as daemon.")
 	rootCmd.PersistentFlags().StringVar(&logFile, "log-file", daemon.DefaultLogFile,
 		"Path to the log file when running as daemon.")
+	rootCmd.PersistentFlags().BoolVar(&discoverEndpoints, "discover", false,
+		"Discover and display all available API endpoints and resources in the cluster, then exit.")
 
 	// Daemon management subcommands
 	rootCmd.AddCommand(daemonStartCmd)
@@ -290,6 +294,15 @@ func getDaemonArgs() []string {
 
 // startHealer parses the flags, initializes the healer, and manages the shutdown signals.
 func startHealer() {
+	// If discover flag is set, run endpoint discovery and exit
+	if discoverEndpoints {
+		if err := discovery.DiscoverClusterEndpoints(kubeconfigPath); err != nil {
+			fmt.Printf("Error discovering cluster endpoints: %v\n", err)
+			os.Exit(1)
+		}
+		return // Exit after discovery
+	}
+
 	// If running as daemon, redirect output to log file
 	if daemonMode {
 		if err := daemon.RedirectOutput(logFile); err != nil {

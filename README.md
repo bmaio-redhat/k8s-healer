@@ -80,6 +80,9 @@ suitable for both local development, test environments, and production environme
     upon connection, including Kubernetes version, cluster host, node count,
     watched namespaces, enabled features, and configuration. Works in both
     foreground and daemon modes.\
+-   **Endpoint Discovery (🆕):** Discover and display all available API endpoints
+    and resources in the cluster using the `--discover` flag. Useful for exploring
+    cluster capabilities and verifying API group availability.\
 -   **Pluggable Architecture:** Easy to extend with new failure
     detection logic or healing strategies.
 
@@ -343,6 +346,14 @@ By default, the tool authenticates using your local **Kubeconfig** file
                                           warnings during      
                                           cluster strain      
                                           (default: enabled). 
+
+  `--discover`                            Discover and display `--discover`
+                                          all available API    
+                                          endpoints and        
+                                          resources in the     
+                                          cluster, then exit.  
+                                          Useful for exploring 
+                                          cluster capabilities.
   
 ------------------------------------------------------------------------
 
@@ -444,6 +455,13 @@ By default, the tool authenticates using your local **Kubeconfig** file
 ./run-healer.sh status
 ./run-healer.sh logs -f
 ./run-healer.sh stop
+
+# Discover all available API endpoints and resources in the cluster
+./k8s-healer --discover
+./k8s-healer --discover -k ~/.kube/config
+
+# Discover endpoints and filter for KubeVirt-specific resources
+./k8s-healer --discover | grep -A 20 "KubeVirt"
 ```
 
 ------------------------------------------------------------------------
