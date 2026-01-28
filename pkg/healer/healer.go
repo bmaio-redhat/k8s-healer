@@ -83,6 +83,12 @@ func NewHealer(kubeconfigPath string, namespaces []string, enableVMHealing bool,
 		return nil, fmt.Errorf("failed to create dynamic client: %w", err)
 	}
 
+	// Initialize WatchedNamespaces map and mark initial namespaces as watched
+	watchedNamespaces := make(map[string]bool)
+	for _, ns := range namespaces {
+		watchedNamespaces[ns] = true
+	}
+
 	healer := &Healer{
 		ClientSet:                  clientset,
 		DynamicClient:              dynamicClient,
@@ -105,6 +111,7 @@ func NewHealer(kubeconfigPath string, namespaces []string, enableVMHealing bool,
 		EnableNamespacePolling:          enableNamespacePolling,
 		NamespacePattern:                namespacePattern,
 		NamespacePollInterval:           namespacePollInterval,
+		WatchedNamespaces:               watchedNamespaces,
 		EnableResourceCreationThrottling: true, // default to enabled
 		CurrentClusterStrain:            nil,  // Will be updated by resource optimization checks
 	}
@@ -293,9 +300,19 @@ func (h *Healer) Watch() {
 		go h.watchResourceOptimization()
 	}
 
-	// Start namespace polling if enabled
-	if h.EnableNamespacePolling && h.NamespacePattern != "" {
-		go h.pollForNewNamespaces()
+	// Start namespace polling if enabled and we have patterns (either explicit or from namespaces)
+	if h.EnableNamespacePolling {
+		hasPattern := h.NamespacePattern != ""
+		hasWildcardInNamespaces := false
+		for _, ns := range h.Namespaces {
+			if strings.Contains(ns, "*") {
+				hasWildcardInNamespaces = true
+				break
+			}
+		}
+		if hasPattern || hasWildcardInNamespaces {
+			go h.pollForNewNamespaces()
+		}
 	}
 
 	// Block the main goroutine until the StopCh channel is closed (on SIGINT/SIGTERM)
@@ -1130,7 +1147,23 @@ func (h *Healer) pollForNewNamespaces() {
 	ticker := time.NewTicker(h.NamespacePollInterval)
 	defer ticker.Stop()
 
-	fmt.Printf("   [INFO] 🔍 Starting namespace polling for pattern: %s (interval: %v)\n", h.NamespacePattern, h.NamespacePollInterval)
+	// Determine pattern display
+	patternDisplay := h.NamespacePattern
+	if patternDisplay == "" {
+		// Extract wildcard patterns from Namespaces
+		wildcardPatterns := []string{}
+		for _, ns := range h.Namespaces {
+			if strings.Contains(ns, "*") {
+				wildcardPatterns = append(wildcardPatterns, ns)
+			}
+		}
+		if len(wildcardPatterns) > 0 {
+			patternDisplay = strings.Join(wildcardPatterns, ",")
+		} else {
+			patternDisplay = "(derived from --namespaces)"
+		}
+	}
+	fmt.Printf("   [INFO] 🔍 Starting namespace polling for pattern: %s (interval: %v)\n", patternDisplay, h.NamespacePollInterval)
 
 	for {
 		select {
@@ -1151,16 +1184,38 @@ func (h *Healer) discoverNewNamespaces() {
 		return
 	}
 
-	// Match namespaces against the pattern
+	// Extract patterns from Namespaces (support multiple patterns like "test-*,e2e-*")
+	patterns := []string{}
+	if h.NamespacePattern != "" {
+		// Use explicit pattern if set
+		patterns = []string{h.NamespacePattern}
+	} else {
+		// Extract wildcard patterns from Namespaces list
+		for _, ns := range h.Namespaces {
+			if strings.Contains(ns, "*") {
+				patterns = append(patterns, ns)
+			}
+		}
+	}
+
+	if len(patterns) == 0 {
+		// No patterns to match against
+		return
+	}
+
+	// Match namespaces against all patterns
 	matchedNamespaces := make(map[string]bool)
 	for _, ns := range nsList.Items {
-		matched, err := filepath.Match(h.NamespacePattern, ns.Name)
-		if err != nil {
-			fmt.Printf("   [WARN] ⚠️ Invalid namespace pattern '%s': %v\n", h.NamespacePattern, err)
-			continue
-		}
-		if matched {
-			matchedNamespaces[ns.Name] = true
+		for _, pattern := range patterns {
+			matched, err := filepath.Match(pattern, ns.Name)
+			if err != nil {
+				fmt.Printf("   [WARN] ⚠️ Invalid namespace pattern '%s': %v\n", pattern, err)
+				continue
+			}
+			if matched {
+				matchedNamespaces[ns.Name] = true
+				break // Found a match, no need to check other patterns
+			}
 		}
 	}
 
@@ -1174,8 +1229,17 @@ func (h *Healer) discoverNewNamespaces() {
 
 	// Start watching new namespaces
 	if len(newNamespaces) > 0 {
+		patternDisplay := h.NamespacePattern
+		if patternDisplay == "" {
+			// Build pattern display from extracted patterns
+			if len(patterns) > 0 {
+				patternDisplay = strings.Join(patterns, ",")
+			} else {
+				patternDisplay = "(from --namespaces)"
+			}
+		}
 		fmt.Printf("   [INFO] ✨ Discovered %d new namespace(s) matching pattern '%s': [%s]\n",
-			len(newNamespaces), h.NamespacePattern, strings.Join(newNamespaces, ", "))
+			len(newNamespaces), patternDisplay, strings.Join(newNamespaces, ", "))
 
 		for _, nsName := range newNamespaces {
 			// Mark as watched
@@ -1191,22 +1255,28 @@ func (h *Healer) discoverNewNamespaces() {
 
 // isTestNamespace checks if a namespace matches the test namespace pattern
 func (h *Healer) isTestNamespace(namespace string) bool {
-	// If namespace polling is enabled and pattern is set, check against pattern
-	if h.EnableNamespacePolling && h.NamespacePattern != "" {
-		matched, err := filepath.Match(h.NamespacePattern, namespace)
-		if err == nil && matched {
-			return true
+	// Build list of patterns to check
+	patterns := []string{}
+	
+	// Add explicit pattern if set
+	if h.NamespacePattern != "" {
+		patterns = append(patterns, h.NamespacePattern)
+	}
+	
+	// Extract wildcard patterns from Namespaces list (from --namespaces flag)
+	for _, ns := range h.Namespaces {
+		if strings.Contains(ns, "*") {
+			patterns = append(patterns, ns)
 		}
 	}
-
-	// If no pattern is explicitly set, don't assume test namespaces
-	if h.NamespacePattern == "" {
+	
+	// If no patterns found, don't assume test namespaces
+	if len(patterns) == 0 {
 		return false
 	}
-
-	// Also check if namespace matches common test namespace patterns
-	testPatterns := []string{"test-*", "e2e-*", "playwright-*", "gating-*"}
-	for _, pattern := range testPatterns {
+	
+	// Check against all patterns
+	for _, pattern := range patterns {
 		matched, err := filepath.Match(pattern, namespace)
 		if err == nil && matched {
 			return true

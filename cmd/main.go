@@ -94,7 +94,7 @@ func init() {
 	rootCmd.PersistentFlags().BoolVar(&enableNamespacePolling, "enable-namespace-polling", true,
 		"Enable polling for new namespaces matching the pattern during test runs. Default: enabled.")
 	rootCmd.PersistentFlags().StringVar(&namespacePattern, "namespace-pattern", "",
-		"Pattern to match namespaces for polling (e.g., 'test-*'). Required if --enable-namespace-polling is set.")
+		"Pattern to match namespaces for polling (e.g., 'test-*'). If not specified and namespace polling is enabled, will be derived from --namespaces flag if it contains wildcards.")
 	rootCmd.PersistentFlags().DurationVar(&namespacePollInterval, "namespace-poll-interval", 30*time.Second,
 		"How often to poll for new namespaces (e.g., 30s, 1m). Default: 30s.")
 	rootCmd.PersistentFlags().BoolVar(&enableResourceOptimization, "enable-resource-optimization", true,
@@ -301,6 +301,27 @@ func startHealer() {
 	if err != nil {
 		fmt.Printf("Error resolving namespaces: %v\n", err)
 		os.Exit(1)
+	}
+
+	// Extract patterns from namespaces flag for namespace polling
+	// If namespace polling is enabled and no explicit pattern is set, derive it from --namespaces
+	if enableNamespacePolling && namespacePattern == "" && namespaces != "" {
+		// Extract wildcard patterns from the namespaces flag
+		patterns := strings.Split(namespaces, ",")
+		wildcardPatterns := []string{}
+		for _, p := range patterns {
+			p = strings.TrimSpace(p)
+			if strings.Contains(p, "*") {
+				wildcardPatterns = append(wildcardPatterns, p)
+			}
+		}
+		// If we found wildcard patterns, use the first one (or combine them)
+		if len(wildcardPatterns) > 0 {
+			namespacePattern = wildcardPatterns[0] // Use first wildcard pattern for polling
+			if len(wildcardPatterns) > 1 {
+				fmt.Printf("Note: Using first wildcard pattern '%s' for namespace polling (from --namespaces flag)\n", namespacePattern)
+			}
+		}
 	}
 
 	// Validate CRD cleanup flags
