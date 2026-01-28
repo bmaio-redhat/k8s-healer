@@ -3,6 +3,7 @@ package healer
 import (
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -10,6 +11,7 @@ import (
 	"github.com/bmaio-redhat/k8s-healer/pkg/util"
 	v1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -19,6 +21,7 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/clientcmd"
+	"k8s.io/client-go/discovery"
 )
 
 // Healer holds the Kubernetes client and configuration for watching.
@@ -79,7 +82,7 @@ func NewHealer(kubeconfigPath string, namespaces []string, enableVMHealing bool,
 		return nil, fmt.Errorf("failed to create dynamic client: %w", err)
 	}
 
-	return &Healer{
+	healer := &Healer{
 		ClientSet:                  clientset,
 		DynamicClient:              dynamicClient,
 		Namespaces:                 namespaces,
@@ -103,7 +106,120 @@ func NewHealer(kubeconfigPath string, namespaces []string, enableVMHealing bool,
 		NamespacePollInterval:           namespacePollInterval,
 		EnableResourceCreationThrottling: true, // default to enabled
 		CurrentClusterStrain:            nil,  // Will be updated by resource optimization checks
-	}, nil
+	}
+
+	// Display cluster information after successful connection
+	healer.DisplayClusterInfo(config, kubeconfigPath)
+
+	return healer, nil
+}
+
+// DisplayClusterInfo displays a summary of the cluster being monitored
+func (h *Healer) DisplayClusterInfo(config *rest.Config, kubeconfigPath string) {
+	// Use fmt.Fprintf to ensure output goes to the correct stream (works in daemon mode)
+	// In daemon mode, os.Stdout is redirected to the log file, so this will write to the log
+	output := func(format string, args ...interface{}) {
+		fmt.Fprintf(os.Stdout, format, args...)
+		// Flush output immediately to ensure it's written to log file in daemon mode
+		os.Stdout.Sync()
+	}
+
+	output("\n" + strings.Repeat("=", 70) + "\n")
+	output("🔗 Connected to Kubernetes Cluster\n")
+	output(strings.Repeat("=", 70) + "\n")
+
+	// Get server version
+	discoveryClient := discovery.NewDiscoveryClient(h.ClientSet.RESTClient())
+	serverVersion, err := discoveryClient.ServerVersion()
+	if err == nil {
+		output("📦 Kubernetes Version: %s\n", serverVersion.GitVersion)
+		output("   Platform: %s/%s\n", serverVersion.Platform, serverVersion.GoVersion)
+	} else {
+		output("📦 Kubernetes Version: Unable to retrieve (error: %v)\n", err)
+	}
+
+	// Get cluster host
+	output("🌐 Cluster Host: %s\n", config.Host)
+
+	// Get current context from kubeconfig if available
+	if kubeconfigPath != "" {
+		loadingRules := clientcmd.NewDefaultClientConfigLoadingRules()
+		loadingRules.ExplicitPath = kubeconfigPath
+		configOverrides := &clientcmd.ConfigOverrides{}
+		kubeConfig := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(loadingRules, configOverrides)
+		if rawConfig, err := kubeConfig.RawConfig(); err == nil {
+			if rawConfig.CurrentContext != "" {
+				output("🔑 Current Context: %s\n", rawConfig.CurrentContext)
+				if ctx, ok := rawConfig.Contexts[rawConfig.CurrentContext]; ok && ctx.Cluster != "" {
+					output("   Cluster: %s\n", ctx.Cluster)
+					if cluster, ok := rawConfig.Clusters[ctx.Cluster]; ok {
+						output("   Server: %s\n", cluster.Server)
+					}
+				}
+			}
+		}
+	}
+
+	// Get node count
+	nodes, err := h.ClientSet.CoreV1().Nodes().List(context.Background(), metav1.ListOptions{})
+	if err == nil {
+		readyNodes := 0
+		for _, node := range nodes.Items {
+			for _, condition := range node.Status.Conditions {
+				if condition.Type == v1.NodeReady && condition.Status == v1.ConditionTrue {
+					readyNodes++
+					break
+				}
+			}
+		}
+		output("🖥️  Nodes: %d total (%d ready)\n", len(nodes.Items), readyNodes)
+	} else {
+		output("🖥️  Nodes: Unable to retrieve (error: %v)\n", err)
+	}
+
+	// Display namespaces being watched
+	if len(h.Namespaces) == 0 || (len(h.Namespaces) == 1 && h.Namespaces[0] == metav1.NamespaceAll) {
+		output("📁 Namespaces: All namespaces\n")
+	} else {
+		output("📁 Namespaces: %d namespace(s) - [%s]\n", len(h.Namespaces), strings.Join(h.Namespaces, ", "))
+	}
+
+	// Display enabled features
+	output("\n⚙️  Enabled Features:\n")
+	output("   • VM Healing: %s\n", formatBool(h.EnableVMHealing))
+	output("   • CRD Cleanup: %s", formatBool(h.EnableCRDCleanup))
+	if h.EnableCRDCleanup {
+		output(" (%d resource types)", len(h.CRDResources))
+	}
+	output("\n")
+	output("   • Resource Optimization: %s", formatBool(h.EnableResourceOptimization))
+	if h.EnableResourceOptimization {
+		output(" (threshold: %.1f%%)", h.StrainThreshold)
+	}
+	output("\n")
+	output("   • Resource Creation Throttling: %s\n", formatBool(h.EnableResourceCreationThrottling))
+	if h.EnableNamespacePolling {
+		output("   • Namespace Polling: %s (pattern: %s, interval: %v)\n", formatBool(h.EnableNamespacePolling), h.NamespacePattern, h.NamespacePollInterval)
+	} else {
+		output("   • Namespace Polling: %s\n", formatBool(h.EnableNamespacePolling))
+	}
+
+	// Display configuration
+	output("\n🔧 Configuration:\n")
+	output("   • Stale Age Threshold: %v\n", h.StaleAge)
+	output("   • Heal Cooldown: %v\n", h.HealCooldown)
+	output("   • Cleanup Finalizers: %s\n", formatBool(h.CleanupFinalizers))
+
+	output(strings.Repeat("=", 70) + "\n")
+	output("\n")
+}
+
+// formatBool returns a formatted string for boolean values
+func formatBool(b bool) string {
+	if b {
+		return "✅ Enabled"
+	}
+	return "❌ Disabled"
 }
 
 // Watch starts the informer loop for all configured namespaces concurrently.
@@ -706,12 +822,27 @@ func (h *Healer) triggerCRDCleanup(resource *unstructured.Unstructured, gvr sche
 		// Get the current resource to update
 		currentResource, err := h.DynamicClient.Resource(gvr).Namespace(resourceNamespace).Get(ctx, resourceName, metav1.GetOptions{})
 		if err != nil {
+			if apierrors.IsNotFound(err) {
+				fmt.Printf("   [SKIP] ⏭️ Resource %s/%s/%s no longer exists, skipping finalizer removal\n", gvr.Resource, resourceNamespace, resourceName)
+				// Resource doesn't exist, remove from tracking and skip deletion
+				resourceKey := fmt.Sprintf("%s/%s/%s", gvr.Resource, resourceNamespace, resourceName)
+				delete(h.TrackedCRDs, resourceKey)
+				return
+			}
 			fmt.Printf("   [WARN] ⚠️ Failed to get resource %s/%s/%s for finalizer removal: %v\n", gvr.Resource, resourceNamespace, resourceName, err)
+			fmt.Printf("   [INFO] 🔄 Proceeding with deletion anyway...\n")
 		} else {
 			// Remove all finalizers
 			currentResource.SetFinalizers([]string{})
 			_, err = h.DynamicClient.Resource(gvr).Namespace(resourceNamespace).Update(ctx, currentResource, metav1.UpdateOptions{})
 			if err != nil {
+				if apierrors.IsNotFound(err) {
+					fmt.Printf("   [SKIP] ⏭️ Resource %s/%s/%s was deleted during finalizer removal\n", gvr.Resource, resourceNamespace, resourceName)
+					// Resource was deleted, remove from tracking and skip deletion
+					resourceKey := fmt.Sprintf("%s/%s/%s", gvr.Resource, resourceNamespace, resourceName)
+					delete(h.TrackedCRDs, resourceKey)
+					return
+				}
 				fmt.Printf("   [WARN] ⚠️ Failed to remove finalizers from %s/%s/%s: %v\n", gvr.Resource, resourceNamespace, resourceName, err)
 				fmt.Printf("   [INFO] 🔄 Proceeding with deletion anyway...\n")
 			} else {
@@ -720,10 +851,33 @@ func (h *Healer) triggerCRDCleanup(resource *unstructured.Unstructured, gvr sche
 		}
 	}
 
-	// Delete the resource
-	err := h.DynamicClient.Resource(gvr).Namespace(resourceNamespace).Delete(ctx, resourceName, metav1.DeleteOptions{})
+	// Check if resource still exists before attempting deletion
+	_, err := h.DynamicClient.Resource(gvr).Namespace(resourceNamespace).Get(ctx, resourceName, metav1.GetOptions{})
 	if err != nil {
-		fmt.Printf("   [FAIL] ❌ Failed to delete %s/%s/%s: %v\n", gvr.Resource, resourceNamespace, resourceName, err)
+		// Resource doesn't exist or was already deleted
+		if apierrors.IsNotFound(err) {
+			fmt.Printf("   [SKIP] ⏭️ Resource %s/%s/%s no longer exists, skipping deletion\n", gvr.Resource, resourceNamespace, resourceName)
+			// Remove from tracked CRDs since it's already gone
+			resourceKey := fmt.Sprintf("%s/%s/%s", gvr.Resource, resourceNamespace, resourceName)
+			delete(h.TrackedCRDs, resourceKey)
+			return
+		}
+		// Other error getting resource
+		fmt.Printf("   [WARN] ⚠️ Failed to check if resource %s/%s/%s exists: %v\n", gvr.Resource, resourceNamespace, resourceName, err)
+		// Continue with deletion attempt anyway
+	}
+
+	// Delete the resource
+	err = h.DynamicClient.Resource(gvr).Namespace(resourceNamespace).Delete(ctx, resourceName, metav1.DeleteOptions{})
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			fmt.Printf("   [SKIP] ⏭️ Resource %s/%s/%s was already deleted\n", gvr.Resource, resourceNamespace, resourceName)
+			// Remove from tracked CRDs since it's already gone
+			resourceKey := fmt.Sprintf("%s/%s/%s", gvr.Resource, resourceNamespace, resourceName)
+			delete(h.TrackedCRDs, resourceKey)
+		} else {
+			fmt.Printf("   [FAIL] ❌ Failed to delete %s/%s/%s: %v\n", gvr.Resource, resourceNamespace, resourceName, err)
+		}
 	} else {
 		fmt.Printf("   [SUCCESS] ✅ Deleted stale resource %s/%s/%s\n", gvr.Resource, resourceNamespace, resourceName)
 		// Remove from tracked CRDs when deleted

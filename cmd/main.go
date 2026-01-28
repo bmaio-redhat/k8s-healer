@@ -91,8 +91,8 @@ func init() {
 		"Age threshold for considering a resource stale (e.g., 1h, 30m). Resources older than this will be cleaned up.")
 	rootCmd.PersistentFlags().BoolVar(&cleanupFinalizers, "cleanup-finalizers", true,
 		"Remove finalizers from resources before deletion to allow cleanup of stuck resources.")
-	rootCmd.PersistentFlags().BoolVar(&enableNamespacePolling, "enable-namespace-polling", false,
-		"Enable polling for new namespaces matching the pattern during test runs.")
+	rootCmd.PersistentFlags().BoolVar(&enableNamespacePolling, "enable-namespace-polling", true,
+		"Enable polling for new namespaces matching the pattern during test runs. Default: enabled.")
 	rootCmd.PersistentFlags().StringVar(&namespacePattern, "namespace-pattern", "",
 		"Pattern to match namespaces for polling (e.g., 'test-*'). Required if --enable-namespace-polling is set.")
 	rootCmd.PersistentFlags().DurationVar(&namespacePollInterval, "namespace-poll-interval", 30*time.Second,

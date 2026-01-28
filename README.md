@@ -40,6 +40,10 @@ in parallel, as it ensures the cluster stays clean and tests can run smoothly.
 strain, helping prevent further resource pressure. Test namespace resources are allowed
 but logged with guidance, while non-test resources receive stronger warnings.
 
+**NEW**: Cluster information summary is displayed immediately upon connection, showing
+Kubernetes version, cluster host, node count, watched namespaces, enabled features, and
+configuration. This information is logged even when running as a daemon.
+
 The tool is designed to be lightweight, safe, and extensible ---
 suitable for both local development, test environments, and production environments.
 
@@ -72,6 +76,10 @@ suitable for both local development, test environments, and production environme
     `SIGTERM`) for safe exits.\
 -   **Daemon Mode (🆕):** Run as a background daemon with automatic
     log file redirection and PID file management.\
+-   **Cluster Information Display (🆕):** Automatically displays cluster summary
+    upon connection, including Kubernetes version, cluster host, node count,
+    watched namespaces, enabled features, and configuration. Works in both
+    foreground and daemon modes.\
 -   **Pluggable Architecture:** Easy to extend with new failure
     detection logic or healing strategies.
 
@@ -215,12 +223,15 @@ This comprehensive list ensures all resources created during Playwright test run
 
 ### Namespace Polling Workflow (Test Environments)
 
+**Namespace polling is enabled by default** to automatically discover and monitor new test namespaces.
+
 1.  **Initial Namespace Resolution:**\
     Resolves wildcard patterns to concrete namespace lists at startup.
 
 2.  **Dynamic Namespace Discovery:**\
-    If namespace polling is enabled, periodically checks the cluster for
-    new namespaces matching the specified pattern (e.g., `test-*`).
+    Periodically checks the cluster for new namespaces matching the specified
+    pattern (e.g., `test-*`). Enabled by default, but requires `--namespace-pattern`
+    to be set to function.
 
 3.  **Automatic Watch Addition:**\
     When new matching namespaces are discovered, automatically starts
@@ -233,6 +244,8 @@ This comprehensive list ensures all resources created during Playwright test run
 5.  **Continuous Operation:**\
     Polling continues throughout the healer's runtime, adapting to
     dynamically created test namespaces.
+
+**Note:** To disable namespace polling, use `--enable-namespace-polling=false`.
 
 ------------------------------------------------------------------------
 
@@ -311,9 +324,10 @@ By default, the tool authenticates using your local **Kubeconfig** file
                            running as daemon (default:        
                            `/tmp/k8s-healer.log`).           
 
-  `--enable-namespace-polling` Enable polling for new        `--enable-namespace-polling`
+  `--enable-namespace-polling` Enable polling for new        `--enable-namespace-polling=false`
                                namespaces matching the        
                                pattern during test runs.       
+                               Default: enabled.
 
   `--namespace-pattern`    Pattern to match namespaces for    `--namespace-pattern "test-*"`
                            polling (e.g., 'test-*'). Required 
@@ -376,15 +390,17 @@ By default, the tool authenticates using your local **Kubeconfig** file
 # CRD cleanup with multiple namespace patterns
 ./k8s-healer --crd-resources "virtualmachines.kubevirt.io/v1" -n "test-*,dev-*,default"
 
-# Enable namespace polling to automatically discover new test namespaces
-./k8s-healer --enable-namespace-polling --namespace-pattern "test-*" -n default
+# Namespace polling is enabled by default - just provide the pattern
+./k8s-healer --namespace-pattern "test-*" -n default
 
-# Namespace polling with custom interval
-./k8s-healer --enable-namespace-polling --namespace-pattern "e2e-*" --namespace-poll-interval 15s -n default
+# Namespace polling with custom interval (enabled by default)
+./k8s-healer --namespace-pattern "e2e-*" --namespace-poll-interval 15s -n default
 
-# Enable namespace polling to protect test pods and optimize resources for them
+# Disable namespace polling if not needed
+./k8s-healer --enable-namespace-polling=false -n default
+
+# Namespace polling to protect test pods and optimize resources for them (enabled by default)
 ./k8s-healer \
-  --enable-namespace-polling \
   --namespace-pattern "test-*" \
   --enable-resource-optimization \
   -k ~/.kube/config \
@@ -595,6 +611,34 @@ You can specify a different source kubeconfig location using the `--source-kubec
 
 ## 🔄 Example Output
 
+### Cluster Information Display (On Connection)
+```
+======================================================================
+🔗 Connected to Kubernetes Cluster
+======================================================================
+📦 Kubernetes Version: v1.28.0
+   Platform: linux/amd64
+🌐 Cluster Host: https://api.example.com:6443
+🔑 Current Context: my-context
+   Cluster: my-cluster
+   Server: https://api.example.com:6443
+🖥️  Nodes: 6 total (6 ready)
+📁 Namespaces: 3 namespace(s) - [default, test-12345, test-67890]
+
+⚙️  Enabled Features:
+   • VM Healing: ✅ Enabled
+   • CRD Cleanup: ✅ Enabled (15 resource types)
+   • Resource Optimization: ✅ Enabled (threshold: 30.0%)
+   • Resource Creation Throttling: ✅ Enabled
+   • Namespace Polling: ✅ Enabled (pattern: test-*, interval: 30s)
+
+🔧 Configuration:
+   • Stale Age Threshold: 6m0s
+   • Heal Cooldown: 10m0s
+   • Cleanup Finalizers: ✅ Enabled
+======================================================================
+```
+
 ### Pod Healing
     [Check] 🚨 Pod prod/api-7d8f9 failed check: CrashLoopBackOff (Restarts: 4).
     !!! HEALING ACTION REQUIRED !!!
@@ -662,6 +706,8 @@ You can specify a different source kubeconfig location using the `--source-kubec
     [SUCCESS] ✅ Removed finalizers from datavolumes/test-ns/datavolume-456
     [SUCCESS] ✅ Deleted stale resource datavolumes/test-ns/datavolume-456
     !!! CRD CLEANUP ACTION COMPLETE !!!
+
+    [SKIP] ⏭️ Resource virtualmachines/test-ns/test-vm-789 no longer exists, skipping deletion
 
 ### Daemon Management
     $ ./k8s-healer start --crd-resources "virtualmachines.kubevirt.io/v1" -n default
