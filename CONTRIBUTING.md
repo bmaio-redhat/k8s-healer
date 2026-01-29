@@ -92,6 +92,24 @@ The project evolved to become a general-purpose janitor for test environments, s
     - Automatically starts watching newly discovered namespaces
     - Supports configurable poll intervals
 
+13. **"lets also extend the cleanup to namespaces that share the same prefix as the one provided on the cli flag, however, lets add the option to also exclude a specific namespace with that same prefix through a new cli flag"**
+    - Result: Added prefix-based namespace discovery
+    - Extracts prefixes from provided namespace names (e.g., `test-123` → `test-*`)
+    - Discovers all namespaces sharing the same prefix
+    - Added `--exclude-namespaces` (`-e`) flag to exclude specific namespaces from deletion
+    - Excluded namespaces are still discovered and monitored, but resources within them are never deleted
+
+14. **"namespace polling should also check for deleted namespaces that follow the provided pattern and stop watching those if the namespace is deleted"**
+    - Result: Added deleted namespace detection
+    - Automatically detects when namespaces matching the pattern are deleted externally
+    - Stops watching deleted namespaces and cleans up tracking information
+
+15. **"make sure we delete namespaces that have the provided pattern after the threshold aside from the excluded one"**
+    - Result: Added automatic namespace deletion
+    - Deletes namespaces matching the pattern (wildcard or prefix) that are older than the stale age threshold
+    - Respects excluded namespaces - they are never deleted even if they match the pattern and exceed the threshold
+    - Namespaces are deleted during namespace polling cycles
+
 ## Design Principles
 
 Based on the evolution above, the following design principles guide the project:

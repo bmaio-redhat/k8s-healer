@@ -52,10 +52,11 @@ type Healer struct {
 	WatchedNamespaces               map[string]bool      // Tracks namespaces we're currently watching
 	EnableResourceCreationThrottling bool                 // Flag to enable resource creation throttling during cluster strain
 	CurrentClusterStrain             *util.ClusterStrainInfo // Current cluster strain state (updated by resource optimization)
+	ExcludedNamespaces               []string             // Namespaces to exclude from prefix-based discovery
 }
 
 // NewHealer initializes the Kubernetes client configuration using kubeconfig or in-cluster settings.
-func NewHealer(kubeconfigPath string, namespaces []string, enableVMHealing bool, enableCRDCleanup bool, crdResources []string, enableNamespacePolling bool, namespacePattern string, namespacePollInterval time.Duration) (*Healer, error) {
+func NewHealer(kubeconfigPath string, namespaces []string, enableVMHealing bool, enableCRDCleanup bool, crdResources []string, enableNamespacePolling bool, namespacePattern string, namespacePollInterval time.Duration, excludedNamespaces []string) (*Healer, error) {
 	var config *rest.Config
 	var err error
 
@@ -115,6 +116,7 @@ func NewHealer(kubeconfigPath string, namespaces []string, enableVMHealing bool,
 		WatchedNamespaces:               watchedNamespaces,
 		EnableResourceCreationThrottling: true, // default to enabled
 		CurrentClusterStrain:            nil,  // Will be updated by resource optimization checks
+		ExcludedNamespaces:               excludedNamespaces,
 	}
 
 	// Display cluster information after successful connection
@@ -367,6 +369,17 @@ func (h *Healer) watchSingleNamespace(namespace string) {
 func (h *Healer) checkAndHealPod(pod *v1.Pod) {
 	// Skip unmanaged pods
 	if len(pod.OwnerReferences) == 0 {
+		return
+	}
+
+	// Skip if namespace is excluded from deletion
+	if h.isExcludedNamespace(pod.Namespace) {
+		// Still monitor but don't delete
+		if util.IsUnhealthy(pod) {
+			reason := util.GetHealReason(pod)
+			fmt.Printf("   [MONITOR] 🔍 Pod %s/%s is unhealthy (%s) but namespace is excluded from deletion\n",
+				pod.Namespace, pod.Name, reason)
+		}
 		return
 	}
 
@@ -641,6 +654,17 @@ func (h *Healer) checkAndHealVirtualMachine(vm *unstructured.Unstructured) {
 		fmt.Printf("   [MONITOR] 🔍 VM %s health check: %s\n", vmKey, reason)
 	}
 
+	// Skip if namespace is excluded from deletion
+	if h.isExcludedNamespace(vm.GetNamespace()) {
+		// Still monitor but don't delete
+		vmAge := time.Since(vm.GetCreationTimestamp().Time)
+		if vmAge > 6*time.Minute {
+			fmt.Printf("   [MONITOR] 🔍 VM %s is older than threshold (%v) but namespace is excluded from deletion\n",
+				vmKey, vmAge.Round(time.Second))
+		}
+		return
+	}
+
 	// Skip if recently healed
 	if lastHeal, ok := h.HealedVMs[vmKey]; ok {
 		if time.Since(lastHeal) < h.HealCooldown {
@@ -800,6 +824,17 @@ func (h *Healer) logCRDCreation(resource *unstructured.Unstructured, gvr schema.
 
 // checkAndCleanupCRDResource checks if a CRD resource is stale and cleans it up if needed
 func (h *Healer) checkAndCleanupCRDResource(resource *unstructured.Unstructured, gvr schema.GroupVersionResource) {
+	// Skip if namespace is excluded from deletion
+	if h.isExcludedNamespace(resource.GetNamespace()) {
+		// Still monitor but don't delete
+		if util.IsCRDResourceStale(resource, h.StaleAge, h.CleanupFinalizers) {
+			reason := util.GetCRDResourceStaleReason(resource, h.StaleAge, h.CleanupFinalizers)
+			fmt.Printf("   [MONITOR] 🔍 CRD resource %s/%s/%s is stale (%s) but namespace is excluded from deletion\n",
+				gvr.Resource, resource.GetNamespace(), resource.GetName(), reason)
+		}
+		return
+	}
+
 	// Skip if recently cleaned
 	resourceKey := fmt.Sprintf("%s/%s/%s", gvr.Resource, resource.GetNamespace(), resource.GetName())
 	if lastClean, ok := h.HealedCRDs[resourceKey]; ok {
@@ -1003,6 +1038,11 @@ func (h *Healer) checkAndOptimizeResources() {
 				continue
 			}
 
+			// Skip if namespace is excluded from deletion
+			if h.isExcludedNamespace(pod.Namespace) {
+				continue
+			}
+
 			// Skip if recently optimized
 			podKey := fmt.Sprintf("%s/%s", pod.Namespace, pod.Name)
 			if lastOpt, ok := h.OptimizedPods[podKey]; ok {
@@ -1187,7 +1227,57 @@ func (h *Healer) pollForNewNamespaces() {
 	}
 }
 
-// discoverNewNamespaces discovers new namespaces matching the pattern and starts watching them
+// extractPrefixesFromNamespaces extracts prefixes from namespace names for prefix-based discovery.
+// For example, "test-123" -> "test-", "e2e-456" -> "e2e-".
+// Returns a map of prefix -> true to avoid duplicates.
+func (h *Healer) extractPrefixesFromNamespaces() map[string]bool {
+	prefixes := make(map[string]bool)
+	
+	for _, ns := range h.Namespaces {
+		// Skip wildcard patterns (they're handled separately)
+		if strings.Contains(ns, "*") {
+			continue
+		}
+		
+		// Extract prefix: find the last separator (hyphen, underscore, or dot)
+		// and use everything before it as the prefix
+		lastHyphen := strings.LastIndex(ns, "-")
+		lastUnderscore := strings.LastIndex(ns, "_")
+		lastDot := strings.LastIndex(ns, ".")
+		
+		lastSeparator := -1
+		if lastHyphen > lastSeparator {
+			lastSeparator = lastHyphen
+		}
+		if lastUnderscore > lastSeparator {
+			lastSeparator = lastUnderscore
+		}
+		if lastDot > lastSeparator {
+			lastSeparator = lastDot
+		}
+		
+		// If we found a separator, extract the prefix
+		if lastSeparator > 0 && lastSeparator < len(ns)-1 {
+			prefix := ns[:lastSeparator+1] // Include the separator
+			prefixes[prefix] = true
+		}
+	}
+	
+	return prefixes
+}
+
+// isExcludedNamespace checks if a namespace is in the exclusion list
+func (h *Healer) isExcludedNamespace(namespace string) bool {
+	for _, excluded := range h.ExcludedNamespaces {
+		if excluded == namespace {
+			return true
+		}
+	}
+	return false
+}
+
+// discoverNewNamespaces discovers new namespaces matching the pattern and starts watching them.
+// It supports both wildcard patterns and prefix-based discovery.
 func (h *Healer) discoverNewNamespaces() {
 	// List all namespaces
 	nsList, err := h.ClientSet.CoreV1().Namespaces().List(context.TODO(), metav1.ListOptions{})
@@ -1210,14 +1300,19 @@ func (h *Healer) discoverNewNamespaces() {
 		}
 	}
 
-	if len(patterns) == 0 {
-		// No patterns to match against
+	// Extract prefixes from non-wildcard namespaces for prefix-based discovery
+	prefixes := h.extractPrefixesFromNamespaces()
+
+	// If we have neither patterns nor prefixes, nothing to discover
+	if len(patterns) == 0 && len(prefixes) == 0 {
 		return
 	}
 
-	// Match namespaces against all patterns
+	// Match namespaces against all patterns and prefixes
+	// Note: We still discover excluded namespaces (they will be monitored but not deleted)
 	matchedNamespaces := make(map[string]bool)
 	for _, ns := range nsList.Items {
+		// Check against wildcard patterns
 		for _, pattern := range patterns {
 			matched, err := filepath.Match(pattern, ns.Name)
 			if err != nil {
@@ -1227,6 +1322,16 @@ func (h *Healer) discoverNewNamespaces() {
 			if matched {
 				matchedNamespaces[ns.Name] = true
 				break // Found a match, no need to check other patterns
+			}
+		}
+		
+		// Check against prefixes (if not already matched)
+		if !matchedNamespaces[ns.Name] {
+			for prefix := range prefixes {
+				if strings.HasPrefix(ns.Name, prefix) {
+					matchedNamespaces[ns.Name] = true
+					break // Found a match, no need to check other prefixes
+				}
 			}
 		}
 	}
@@ -1239,13 +1344,93 @@ func (h *Healer) discoverNewNamespaces() {
 		}
 	}
 
+	// Check for deleted namespaces that we're still watching
+	// Build a set of existing namespace names for quick lookup
+	existingNamespaces := make(map[string]bool)
+	for _, ns := range nsList.Items {
+		existingNamespaces[ns.Name] = true
+	}
+
+	// Find namespaces we're watching that no longer exist and match the pattern
+	// We only remove namespaces that:
+	// 1. Match the pattern (wildcard or prefix) - meaning they were dynamically discovered
+	// 2. No longer exist in the cluster
+	deletedNamespaces := []string{}
+	for watchedNs := range h.WatchedNamespaces {
+		// Skip if namespace still exists
+		if existingNamespaces[watchedNs] {
+			continue
+		}
+		
+		// Check if it matches any pattern (wildcard)
+		matchesPattern := false
+		for _, pattern := range patterns {
+			matched, err := filepath.Match(pattern, watchedNs)
+			if err == nil && matched {
+				matchesPattern = true
+				break
+			}
+		}
+		
+		// Check if it matches any prefix (if not already matched by wildcard)
+		if !matchesPattern {
+			for prefix := range prefixes {
+				if strings.HasPrefix(watchedNs, prefix) {
+					matchesPattern = true
+					break
+				}
+			}
+		}
+		
+		// Only remove if it matches the pattern (was dynamically discovered)
+		// Namespaces that don't match the pattern were explicitly specified and should be kept
+		if matchesPattern {
+			deletedNamespaces = append(deletedNamespaces, watchedNs)
+		}
+	}
+
+	// Remove deleted namespaces from tracking
+	if len(deletedNamespaces) > 0 {
+		fmt.Printf("   [INFO] 🗑️  Detected %d deleted namespace(s) matching pattern: [%s]\n",
+			len(deletedNamespaces), strings.Join(deletedNamespaces, ", "))
+		
+		for _, nsName := range deletedNamespaces {
+			// Remove from watched namespaces map
+			delete(h.WatchedNamespaces, nsName)
+			
+			// Remove from Namespaces list
+			for i, ns := range h.Namespaces {
+				if ns == nsName {
+					h.Namespaces = append(h.Namespaces[:i], h.Namespaces[i+1:]...)
+					break
+				}
+			}
+			
+			fmt.Printf("   [INFO] ⏹️  Stopped watching deleted namespace: %s\n", nsName)
+		}
+	}
+
+	// Check for stale namespaces that should be deleted
+	h.checkAndDeleteStaleNamespaces(nsList.Items, patterns, prefixes)
+
 	// Start watching new namespaces
 	if len(newNamespaces) > 0 {
 		patternDisplay := h.NamespacePattern
 		if patternDisplay == "" {
-			// Build pattern display from extracted patterns
+			// Build pattern display from extracted patterns and prefixes
+			displayParts := []string{}
 			if len(patterns) > 0 {
-				patternDisplay = strings.Join(patterns, ",")
+				displayParts = append(displayParts, strings.Join(patterns, ","))
+			}
+			if len(prefixes) > 0 {
+				prefixList := []string{}
+				for prefix := range prefixes {
+					prefixList = append(prefixList, prefix+"*")
+				}
+				displayParts = append(displayParts, strings.Join(prefixList, ","))
+			}
+			if len(displayParts) > 0 {
+				patternDisplay = strings.Join(displayParts, ",")
 			} else {
 				patternDisplay = "(from --namespaces)"
 			}
@@ -1263,6 +1448,102 @@ func (h *Healer) discoverNewNamespaces() {
 			fmt.Printf("   [INFO] ✅ Started watching new namespace: %s\n", nsName)
 		}
 	}
+}
+
+// checkAndDeleteStaleNamespaces checks namespaces matching the pattern and deletes them if they're older than the threshold
+func (h *Healer) checkAndDeleteStaleNamespaces(namespaces []v1.Namespace, patterns []string, prefixes map[string]bool) {
+	now := time.Now()
+	staleNamespaces := []v1.Namespace{}
+
+	// Find namespaces that match the pattern and are older than the threshold
+	for _, ns := range namespaces {
+		// Skip excluded namespaces
+		if h.isExcludedNamespace(ns.Name) {
+			continue
+		}
+
+		// Check if namespace matches any pattern
+		matchesPattern := false
+		for _, pattern := range patterns {
+			matched, err := filepath.Match(pattern, ns.Name)
+			if err == nil && matched {
+				matchesPattern = true
+				break
+			}
+		}
+
+		// Check if namespace matches any prefix (if not already matched by wildcard)
+		if !matchesPattern {
+			for prefix := range prefixes {
+				if strings.HasPrefix(ns.Name, prefix) {
+					matchesPattern = true
+					break
+				}
+			}
+		}
+
+		// Only check age for namespaces that match the pattern
+		if matchesPattern {
+			nsAge := now.Sub(ns.CreationTimestamp.Time)
+			if nsAge > h.StaleAge {
+				staleNamespaces = append(staleNamespaces, ns)
+			}
+		}
+	}
+
+	// Delete stale namespaces
+	if len(staleNamespaces) > 0 {
+		nsNames := make([]string, len(staleNamespaces))
+		for i, ns := range staleNamespaces {
+			nsNames[i] = ns.Name
+		}
+		fmt.Printf("   [INFO] 🗑️  Found %d stale namespace(s) matching pattern (older than %v): [%s]\n",
+			len(staleNamespaces), h.StaleAge, strings.Join(nsNames, ", "))
+
+		for _, ns := range staleNamespaces {
+			h.triggerNamespaceDeletion(&ns)
+		}
+	}
+}
+
+// triggerNamespaceDeletion deletes a namespace
+func (h *Healer) triggerNamespaceDeletion(ns *v1.Namespace) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*30)
+	defer cancel()
+
+	nsAge := time.Since(ns.CreationTimestamp.Time)
+	fmt.Printf("\n!!! NAMESPACE CLEANUP ACTION REQUIRED !!!\n")
+	fmt.Printf("    Namespace: %s\n", ns.Name)
+	fmt.Printf("    Age: %v (threshold: %v)\n", nsAge.Round(time.Second), h.StaleAge)
+
+	err := h.ClientSet.CoreV1().Namespaces().Delete(ctx, ns.Name, metav1.DeleteOptions{})
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			fmt.Printf("   [SKIP] ⏭️ Namespace %s was already deleted\n", ns.Name)
+			// Remove from tracking if it was already deleted
+			delete(h.WatchedNamespaces, ns.Name)
+			for i, watchedNs := range h.Namespaces {
+				if watchedNs == ns.Name {
+					h.Namespaces = append(h.Namespaces[:i], h.Namespaces[i+1:]...)
+					break
+				}
+			}
+		} else {
+			fmt.Printf("   [FAIL] ❌ Failed to delete namespace %s: %v\n", ns.Name, err)
+		}
+	} else {
+		fmt.Printf("   [SUCCESS] ✅ Deleted stale namespace %s\n", ns.Name)
+		// Remove from tracking
+		delete(h.WatchedNamespaces, ns.Name)
+		for i, watchedNs := range h.Namespaces {
+			if watchedNs == ns.Name {
+				h.Namespaces = append(h.Namespaces[:i], h.Namespaces[i+1:]...)
+				break
+			}
+		}
+	}
+
+	fmt.Printf("!!! NAMESPACE CLEANUP ACTION COMPLETE !!!\n\n")
 }
 
 // isTestNamespace checks if a namespace matches the test namespace pattern

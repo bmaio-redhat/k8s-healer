@@ -26,23 +26,27 @@ For OpenShift clusters with VM healing enabled, it also monitors node health
 and can automatically drain and delete failing nodes, allowing the machine
 controller to recreate them.
 
-**NEW**: It now also monitors VirtualMachine resources directly. VMs are only deleted
+The tool monitors VirtualMachine resources directly. VMs are only deleted
 if they exist for more than 6 minutes (allowing tests to self-cleanup). VMs in
 ErrorUnschedulable state are cleaned up after 3 minutes to handle scheduling failures
 faster while still allowing time for recovery.
 
-**NEW**: CRD cleanup mode allows the tool to act as a janitor for test environments,
+CRD cleanup mode allows the tool to act as a janitor for test environments,
 automatically cleaning up stale CRD resources that are stuck, in error states, or
 older than a configurable threshold. This is particularly useful when running tests
 in parallel, as it ensures the cluster stays clean and tests can run smoothly.
 
-**NEW**: Resource creation throttling warns when resources are created during cluster
+Resource creation throttling warns when resources are created during cluster
 strain, helping prevent further resource pressure. Test namespace resources are allowed
 but logged with guidance, while non-test resources receive stronger warnings.
 
-**NEW**: Cluster information summary is displayed immediately upon connection, showing
+Cluster information summary is displayed immediately upon connection, showing
 Kubernetes version, cluster host, node count, watched namespaces, enabled features, and
 configuration. This information is logged even when running as a daemon.
+
+Namespace management includes automatic discovery of namespaces matching patterns,
+monitoring of discovered namespaces, and automatic cleanup of stale namespaces that
+exceed the age threshold, while respecting exclusion lists.
 
 The tool is designed to be lightweight, safe, and extensible ---
 suitable for both local development, test environments, and production environments.
@@ -57,30 +61,34 @@ suitable for both local development, test environments, and production environme
     restart threshold and are stuck in states like `CrashLoopBackOff`.\
 -   **VM Healing (OpenShift):** Monitors node health and VirtualMachine resources,
     automatically draining/deleting failing nodes and VMs for remediation.\
--   **CRD Cleanup (🆕):** Acts as a janitor for test environments by cleaning up
+-   **CRD Cleanup:** Acts as a janitor for test environments by cleaning up
     stale CRD resources that are stuck with finalizers, in error states, or older
     than a configurable threshold.\
--   **Resource Optimization (🆕):** Proactively optimizes cluster resources during
+-   **Resource Optimization:** Proactively optimizes cluster resources during
     strain by detecting cluster-wide resource pressure and evicting resource-constrained
     pods (OOMKilled, high restart count, stuck in Pending). Helps keep clusters healthy
     during heavy test workloads.\
--   **Resource Creation Throttling (🆕):** Monitors and warns when resources are created
+-   **Resource Creation Throttling:** Monitors and warns when resources are created
     during cluster strain, helping prevent further resource pressure. Provides actionable
     guidance to operators about deferring non-critical resource creation.\
--   **Healing Cooldown (🆕):** Prevents repeated healing loops by
+-   **Healing Cooldown:** Prevents repeated healing loops by
     skipping Pods recently healed within a configurable cooldown period
     (default: **10 minutes**).\
 -   **Flexible Namespace Selection:** Supports multiple namespaces and
     wildcard patterns (e.g. `app-*`, `prod-*`).\
+-   **Namespace Management:** Automatically discovers namespaces matching patterns,
+    monitors them for resource cleanup, and deletes stale namespaces that exceed
+    the age threshold. Supports namespace exclusion to protect specific namespaces
+    from deletion while still monitoring them.\
 -   **Graceful Shutdown:** Handles OS signals cleanly (`Ctrl+C`,
     `SIGTERM`) for safe exits.\
--   **Daemon Mode (🆕):** Run as a background daemon with automatic
+-   **Daemon Mode:** Run as a background daemon with automatic
     log file redirection and PID file management.\
--   **Cluster Information Display (🆕):** Automatically displays cluster summary
+-   **Cluster Information Display:** Automatically displays cluster summary
     upon connection, including Kubernetes version, cluster host, node count,
     watched namespaces, enabled features, and configuration. Works in both
     foreground and daemon modes.\
--   **Endpoint Discovery (🆕):** Discover and display all available API endpoints
+-   **Endpoint Discovery:** Discover and display all available API endpoints
     and resources in the cluster using the `--discover` flag. Useful for exploring
     cluster capabilities and verifying API group availability.\
 -   **Pluggable Architecture:** Easy to extend with new failure
@@ -98,7 +106,7 @@ suitable for both local development, test environments, and production environme
     If a container's `RestartCount` exceeds a configurable threshold
     (default: `3`), the Pod is marked unhealthy.
 
-2.  **Cooldown Check (🆕):**\
+2.  **Cooldown Check:**\
     Before deleting, k8s-healer verifies whether the Pod was healed
     recently.\
     If the same Pod was healed within the **cooldown window** (default:
@@ -224,17 +232,20 @@ This comprehensive list ensures all resources created during Playwright test run
     By continuously cleaning up stale resources, tests can run smoothly
     without interference from leftover test artifacts.
 
-### Namespace Polling Workflow (Test Environments)
+### Namespace Management Workflow (Test Environments)
 
-**Namespace polling is enabled by default** to automatically discover and monitor new test namespaces.
+**Namespace polling is enabled by default** to automatically discover, monitor, and clean up test namespaces.
 
 1.  **Initial Namespace Resolution:**\
     Resolves wildcard patterns to concrete namespace lists at startup.
+    Also extracts prefixes from provided namespaces (e.g., `test-123` → `test-*`)
+    for prefix-based discovery.
 
 2.  **Dynamic Namespace Discovery:**\
     Periodically checks the cluster for new namespaces matching the specified
-    pattern (e.g., `test-*`). Enabled by default, but requires `--namespace-pattern`
-    to be set to function.
+    pattern (wildcard like `test-*`) or prefix (derived from provided namespaces).
+    Enabled by default, but requires either `--namespace-pattern` or namespaces
+    with extractable prefixes to function.
 
 3.  **Automatic Watch Addition:**\
     When new matching namespaces are discovered, automatically starts
@@ -244,9 +255,23 @@ This comprehensive list ensures all resources created during Playwright test run
     Newly discovered namespaces are immediately monitored, ensuring
     test namespaces created during parallel test execution are covered.
 
-5.  **Continuous Operation:**\
+5.  **Deleted Namespace Detection:**\
+    Automatically detects when namespaces matching the pattern are deleted
+    externally and stops watching them, cleaning up tracking information.
+
+6.  **Stale Namespace Cleanup:**\
+    Automatically deletes namespaces that match the pattern and are older
+    than the stale age threshold (default: 6 minutes). Excluded namespaces
+    are never deleted, even if they match the pattern and exceed the threshold.
+
+7.  **Namespace Exclusion:**\
+    Namespaces specified in `--exclude-namespaces` are still discovered and
+    monitored, but resources within them are never deleted. This allows
+    protecting important test namespaces while still monitoring their health.
+
+8.  **Continuous Operation:**\
     Polling continues throughout the healer's runtime, adapting to
-    dynamically created test namespaces.
+    dynamically created and deleted test namespaces.
 
 **Note:** To disable namespace polling, use `--enable-namespace-polling=false`.
 
@@ -340,6 +365,13 @@ By default, the tool authenticates using your local **Kubeconfig** file
   `--namespace-poll-interval` How often to poll for new       `--namespace-poll-interval 30s`
                              namespaces (e.g., 30s, 1m).      
                              Default: `30s`.                  
+
+  `--exclude-namespaces`, `-e` Comma-separated list of       `--exclude-namespaces test-keep,test-important`
+                             namespaces to exclude from       `-e test-keep`
+                             deletion. These namespaces       
+                             are still discovered and         
+                             monitored, but resources         
+                             within them are never deleted.   
 
   `--enable-resource-creation-throttling` Enable resource     `--enable-resource-creation-throttling=false`
                                           creation throttling  
@@ -462,6 +494,19 @@ By default, the tool authenticates using your local **Kubeconfig** file
 
 # Discover endpoints and filter for KubeVirt-specific resources
 ./k8s-healer --discover | grep -A 20 "KubeVirt"
+
+# Watch namespaces with prefix-based discovery and exclude specific namespaces from deletion
+./k8s-healer -n test-123 -e test-keep,test-important
+# This will discover and watch: test-123, test-456, test-789, test-keep, test-important
+# But will only delete resources from: test-123, test-456, test-789
+# test-keep and test-important are monitored but protected from deletion
+
+# Watch namespaces with wildcard pattern and exclude namespaces
+./k8s-healer -n "test-*" -e test-keep
+# All test-* namespaces are discovered and watched
+# test-keep is excluded from resource deletion
+# Stale namespaces matching test-* (older than 6 minutes) are automatically deleted
+# test-keep is never deleted, even if it's old
 ```
 
 ------------------------------------------------------------------------
@@ -750,6 +795,25 @@ You can specify a different source kubeconfig location using the `--source-kubec
         Action: Evicting to free resources for test namespace pods
     [SUCCESS] ✅ Evicted pod default/app-pod-1 for resource optimization
     !!! RESOURCE OPTIMIZATION ACTION COMPLETE !!!
+
+### Namespace Management
+    [INFO] 🔍 Starting namespace polling for pattern: test-* (interval: 30s)
+    [INFO] ✨ Discovered 2 new namespace(s) matching pattern 'test-*': [test-456, test-789]
+    [INFO] ✅ Started watching new namespace: test-456
+    [INFO] ✅ Started watching new namespace: test-789
+    
+    [INFO] 🗑️  Detected 1 deleted namespace(s) matching pattern: [test-456]
+    [INFO] ⏹️  Stopped watching deleted namespace: test-456
+    
+    [INFO] 🗑️  Found 1 stale namespace(s) matching pattern (older than 6m0s): [test-789]
+    !!! NAMESPACE CLEANUP ACTION REQUIRED !!!
+        Namespace: test-789
+        Age: 10m0s (threshold: 6m0s)
+    [SUCCESS] ✅ Deleted stale namespace test-789
+    !!! NAMESPACE CLEANUP ACTION COMPLETE !!!
+    
+    [MONITOR] 🔍 Pod test-keep/unhealthy-pod is unhealthy (CrashLoopBackOff) but namespace is excluded from deletion
+    [MONITOR] 🔍 VM test-important/old-vm is older than threshold (10m0s) but namespace is excluded from deletion
 
 ### Resource Creation Throttling
     [INFO] ⚠️ Cluster under strain: 35.0% of nodes (2/6) under resource pressure

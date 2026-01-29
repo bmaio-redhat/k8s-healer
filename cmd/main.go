@@ -35,6 +35,7 @@ var (
 	enableResourceCreationThrottling bool
 	namespacePattern                 string
 	namespacePollInterval            time.Duration
+	excludeNamespaces                string
 	daemonMode                       bool
 	pidFile                          string
 	logFile                          string
@@ -113,6 +114,8 @@ func init() {
 		"Path to the log file when running as daemon.")
 	rootCmd.PersistentFlags().BoolVar(&discoverEndpoints, "discover", false,
 		"Discover and display all available API endpoints and resources in the cluster, then exit.")
+	rootCmd.PersistentFlags().StringVarP(&excludeNamespaces, "exclude-namespaces", "e", "",
+		"Comma-separated list of namespaces to exclude from prefix-based discovery (e.g., 'test-keep,test-important').")
 
 	// Daemon management subcommands
 	rootCmd.AddCommand(daemonStartCmd)
@@ -120,9 +123,47 @@ func init() {
 	rootCmd.AddCommand(daemonStatusCmd)
 }
 
+// extractPrefixesFromNamespaces extracts prefixes from namespace names for prefix-based discovery.
+// For example, "test-123" -> "test-", "e2e-456" -> "e2e-".
+func extractPrefixesFromNamespaces(namespaces []string) map[string]bool {
+	prefixes := make(map[string]bool)
+	
+	for _, ns := range namespaces {
+		// Skip wildcard patterns (they're handled separately)
+		if strings.Contains(ns, "*") {
+			continue
+		}
+		
+		// Extract prefix: find the last separator (hyphen, underscore, or dot)
+		// and use everything before it as the prefix
+		lastHyphen := strings.LastIndex(ns, "-")
+		lastUnderscore := strings.LastIndex(ns, "_")
+		lastDot := strings.LastIndex(ns, ".")
+		
+		lastSeparator := -1
+		if lastHyphen > lastSeparator {
+			lastSeparator = lastHyphen
+		}
+		if lastUnderscore > lastSeparator {
+			lastSeparator = lastUnderscore
+		}
+		if lastDot > lastSeparator {
+			lastSeparator = lastDot
+		}
+		
+		// If we found a separator, extract the prefix
+		if lastSeparator > 0 && lastSeparator < len(ns)-1 {
+			prefix := ns[:lastSeparator+1] // Include the separator
+			prefixes[prefix] = true
+		}
+	}
+	
+	return prefixes
+}
+
 // resolveWildcardNamespaces connects to the cluster, lists all namespaces, and returns a concrete list
-// based on the input patterns, handling wildcards using filepath.Match.
-func resolveWildcardNamespaces(kubeconfigPath, namespacesInput string) ([]string, error) {
+// based on the input patterns, handling wildcards using filepath.Match and prefix-based discovery.
+func resolveWildcardNamespaces(kubeconfigPath, namespacesInput string, excludedNamespaces []string) ([]string, error) {
 	if namespacesInput == "" {
 		return []string{}, nil // Return empty list, signaling the healer to watch all.
 	}
@@ -132,14 +173,31 @@ func resolveWildcardNamespaces(kubeconfigPath, namespacesInput string) ([]string
 		patterns[i] = strings.TrimSpace(p)
 	}
 
-	// Check if any pattern contains a wildcard. If not, just return the list of patterns.
+	// Create a map of excluded namespaces for quick lookup
+	excludedMap := make(map[string]bool)
+	for _, excluded := range excludedNamespaces {
+		excludedMap[excluded] = true
+	}
+
+	// Check if any pattern contains a wildcard or if we need prefix-based discovery
 	needsResolution := false
+	hasWildcards := false
 	for _, p := range patterns {
 		if strings.Contains(p, "*") {
 			needsResolution = true
+			hasWildcards = true
 			break
 		}
 	}
+	
+	// Also check if we have non-wildcard namespaces that need prefix-based discovery
+	prefixes := extractPrefixesFromNamespaces(patterns)
+	if len(prefixes) > 0 {
+		needsResolution = true
+	}
+
+	// If no resolution needed, just return the list
+	// Note: We still include excluded namespaces (they will be monitored but not deleted)
 	if !needsResolution {
 		return patterns, nil
 	}
@@ -172,17 +230,42 @@ func resolveWildcardNamespaces(kubeconfigPath, namespacesInput string) ([]string
 
 	resolvedNamespaces := make(map[string]bool)
 
-	// Match existing namespaces against all patterns
+	// First, add explicitly specified namespaces (non-wildcard)
+	// Note: We still include excluded namespaces (they will be monitored but not deleted)
+	for _, ns := range patterns {
+		if !strings.Contains(ns, "*") {
+			resolvedNamespaces[ns] = true
+		}
+	}
+
+	// Match existing namespaces against all patterns and prefixes
+	// Note: We still include excluded namespaces in the watched list (they will be monitored but not deleted)
 	for _, ns := range nsList.Items {
-		for _, pattern := range patterns {
-			match, err := filepath.Match(pattern, ns.Name)
-			if err != nil {
-				// This shouldn't happen with simple glob patterns
-				fmt.Printf("Warning: Invalid wildcard pattern '%s': %v\n", pattern, err)
-				continue
+		// Match against wildcard patterns
+		if hasWildcards {
+			for _, pattern := range patterns {
+				if strings.Contains(pattern, "*") {
+					match, err := filepath.Match(pattern, ns.Name)
+					if err != nil {
+						// This shouldn't happen with simple glob patterns
+						fmt.Printf("Warning: Invalid wildcard pattern '%s': %v\n", pattern, err)
+						continue
+					}
+					if match {
+						resolvedNamespaces[ns.Name] = true
+						break // Found a match, no need to check other patterns
+					}
+				}
 			}
-			if match {
-				resolvedNamespaces[ns.Name] = true
+		}
+		
+		// Match against prefixes (if not already matched)
+		if !resolvedNamespaces[ns.Name] {
+			for prefix := range prefixes {
+				if strings.HasPrefix(ns.Name, prefix) {
+					resolvedNamespaces[ns.Name] = true
+					break // Found a match, no need to check other prefixes
+				}
 			}
 		}
 	}
@@ -194,9 +277,9 @@ func resolveWildcardNamespaces(kubeconfigPath, namespacesInput string) ([]string
 	}
 
 	if len(finalNsList) > 0 {
-		fmt.Printf("Wildcards resolved. Watching %d namespaces: [%s]\n", len(finalNsList), strings.Join(finalNsList, ", "))
+		fmt.Printf("Wildcards and prefixes resolved. Watching %d namespaces: [%s]\n", len(finalNsList), strings.Join(finalNsList, ", "))
 	} else {
-		fmt.Println("Warning: Wildcard patterns did not match any existing namespaces.")
+		fmt.Println("Warning: Wildcard patterns and prefixes did not match any existing namespaces.")
 	}
 
 	return finalNsList, nil
@@ -284,6 +367,9 @@ func getDaemonArgs() []string {
 	if strainThreshold != 30.0 {
 		args = append(args, "--strain-threshold", fmt.Sprintf("%.1f", strainThreshold))
 	}
+	if excludeNamespaces != "" {
+		args = append(args, "--exclude-namespaces", excludeNamespaces)
+	}
 	// Add daemon flag so the child process knows it's running as daemon
 	args = append(args, "--daemon")
 	args = append(args, "--pid-file", pidFile)
@@ -309,8 +395,21 @@ func startHealer() {
 			fmt.Printf("Warning: Failed to redirect output to log file: %v\n", err)
 		}
 	}
-	// Resolve the raw namespace input (including wildcards) into a concrete list of existing namespaces
-	nsList, err := resolveWildcardNamespaces(kubeconfigPath, namespaces)
+	
+	// Parse excluded namespaces
+	var excludedNsList []string
+	if excludeNamespaces != "" {
+		excludedParts := strings.Split(excludeNamespaces, ",")
+		for _, part := range excludedParts {
+			trimmed := strings.TrimSpace(part)
+			if trimmed != "" {
+				excludedNsList = append(excludedNsList, trimmed)
+			}
+		}
+	}
+	
+	// Resolve the raw namespace input (including wildcards and prefixes) into a concrete list of existing namespaces
+	nsList, err := resolveWildcardNamespaces(kubeconfigPath, namespaces, excludedNsList)
 	if err != nil {
 		fmt.Printf("Error resolving namespaces: %v\n", err)
 		os.Exit(1)
@@ -378,7 +477,7 @@ func startHealer() {
 	}
 
 	// Initialize the Healer module. This connects to Kubernetes.
-	healer, err := healer.NewHealer(kubeconfigPath, nsList, enableVMHealing, enableCRDCleanup, crdResourceList, enableNamespacePolling, namespacePattern, namespacePollInterval)
+	healer, err := healer.NewHealer(kubeconfigPath, nsList, enableVMHealing, enableCRDCleanup, crdResourceList, enableNamespacePolling, namespacePattern, namespacePollInterval, excludedNsList)
 	if err != nil {
 		fmt.Printf("Error setting up Kubernetes client: %v\n", err)
 		os.Exit(1)
