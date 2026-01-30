@@ -98,8 +98,8 @@ func init() {
 		"Enable polling for new namespaces matching the pattern during test runs. Default: enabled.")
 	rootCmd.PersistentFlags().StringVar(&namespacePattern, "namespace-pattern", "",
 		"Pattern to match namespaces for polling (e.g., 'test-*'). If not specified and namespace polling is enabled, will be derived from --namespaces flag if it contains wildcards.")
-	rootCmd.PersistentFlags().DurationVar(&namespacePollInterval, "namespace-poll-interval", 30*time.Second,
-		"How often to poll for new namespaces (e.g., 30s, 1m). Default: 30s.")
+	rootCmd.PersistentFlags().DurationVar(&namespacePollInterval, "namespace-poll-interval", 5*time.Second,
+		"How often to poll for new namespaces (e.g., 5s, 1m). Default: 5s.")
 	rootCmd.PersistentFlags().BoolVar(&enableResourceOptimization, "enable-resource-optimization", true,
 		"Enable resource optimization during cluster strain - evicts resource-constrained pods when cluster is under pressure. Default: enabled.")
 	rootCmd.PersistentFlags().Float64Var(&strainThreshold, "strain-threshold", 30.0,
@@ -456,8 +456,9 @@ func startHealer() {
 			"virtualmachineclusterinstancetypes.instancetype.kubevirt.io/v1beta1," +
 			"virtualmachinepreferences.instancetype.kubevirt.io/v1beta1," +
 			"virtualmachineclusterpreferences.instancetype.kubevirt.io/v1beta1," +
-			// Migration policies
+			// Migration policies and plans
 			"migrationpolicies.migrations.kubevirt.io/v1alpha1," +
+			"virtualmachinemigrationplans.kubevirt.io/v1alpha1," +
 			// Network resources
 			"network-attachment-definitions.k8s.cni.cncf.io/v1," +
 			"userdefinednetworks.k8s.ovn.org/v1," +

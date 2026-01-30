@@ -1,0 +1,39 @@
+# Build artifacts
+k8s-healer
+*.out
+*.html
+coverage.out
+coverage.html
+
+# Test files
+*_test.go
+
+# Git files
+.git
+.gitignore
+.gitattributes
+
+# Documentation (not needed in container)
+README.md
+CONTRIBUTING.md
+LICENSE
+
+# Scripts (not needed in container)
+run-healer.sh
+Makefile
+
+# IDE files
+.vscode
+.idea
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.log
+*.pid

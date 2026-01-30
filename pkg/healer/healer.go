@@ -8,51 +8,51 @@ import (
 	"strings"
 	"time"
 
-	"github.com/bmaio-redhat/k8s-healer/pkg/util"
 	"github.com/bmaio-redhat/k8s-healer/pkg/healthcheck"
+	"github.com/bmaio-redhat/k8s-healer/pkg/util"
 	v1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/version"
+	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/clientcmd"
-	"k8s.io/client-go/discovery"
-	"k8s.io/apimachinery/pkg/version"
 )
 
 // Healer holds the Kubernetes client and configuration for watching.
 type Healer struct {
-	ClientSet                  kubernetes.Interface
-	DynamicClient              dynamic.Interface
-	Namespaces                 []string
-	StopCh                     chan struct{}
-	HealedPods                 map[string]time.Time // Tracks recently healed pods
-	HealedNodes                map[string]time.Time // Tracks recently healed nodes
-	HealedVMs                  map[string]time.Time // Tracks recently healed VMs
-	HealedCRDs                 map[string]time.Time // Tracks recently cleaned CRDs
-	TrackedCRDs                map[string]bool      // Tracks all CRD resources we've seen (for creation logging)
-	HealCooldown               time.Duration
-	EnableVMHealing            bool                 // Flag to enable VM healing
-	EnableCRDCleanup           bool                 // Flag to enable CRD cleanup
-	CRDResources               []string             // List of CRD resources to monitor (e.g., ["virtualmachines.virtualmachine.kubevirt.io"])
-	StaleAge                   time.Duration        // Age threshold for stale resources
-	CleanupFinalizers          bool                 // Whether to remove finalizers before deletion
-	EnableResourceOptimization bool                 // Flag to enable resource optimization during cluster strain
-	StrainThreshold            float64              // Percentage of nodes under pressure to trigger optimization
-	OptimizedPods              map[string]time.Time // Tracks recently optimized pods
-	EnableNamespacePolling          bool                 // Flag to enable namespace polling
-	NamespacePattern                string               // Pattern to match namespaces (e.g., "test-*")
-	NamespacePollInterval           time.Duration        // How often to poll for new namespaces
-	WatchedNamespaces               map[string]bool      // Tracks namespaces we're currently watching
-	EnableResourceCreationThrottling bool                 // Flag to enable resource creation throttling during cluster strain
+	ClientSet                        kubernetes.Interface
+	DynamicClient                    dynamic.Interface
+	Namespaces                       []string
+	StopCh                           chan struct{}
+	HealedPods                       map[string]time.Time // Tracks recently healed pods
+	HealedNodes                      map[string]time.Time // Tracks recently healed nodes
+	HealedVMs                        map[string]time.Time // Tracks recently healed VMs
+	HealedCRDs                       map[string]time.Time // Tracks recently cleaned CRDs
+	TrackedCRDs                      map[string]bool      // Tracks all CRD resources we've seen (for creation logging)
+	HealCooldown                     time.Duration
+	EnableVMHealing                  bool                    // Flag to enable VM healing
+	EnableCRDCleanup                 bool                    // Flag to enable CRD cleanup
+	CRDResources                     []string                // List of CRD resources to monitor (e.g., ["virtualmachines.virtualmachine.kubevirt.io"])
+	StaleAge                         time.Duration           // Age threshold for stale resources
+	CleanupFinalizers                bool                    // Whether to remove finalizers before deletion
+	EnableResourceOptimization       bool                    // Flag to enable resource optimization during cluster strain
+	StrainThreshold                  float64                 // Percentage of nodes under pressure to trigger optimization
+	OptimizedPods                    map[string]time.Time    // Tracks recently optimized pods
+	EnableNamespacePolling           bool                    // Flag to enable namespace polling
+	NamespacePattern                 string                  // Pattern to match namespaces (e.g., "test-*")
+	NamespacePollInterval            time.Duration           // How often to poll for new namespaces
+	WatchedNamespaces                map[string]bool         // Tracks namespaces we're currently watching
+	EnableResourceCreationThrottling bool                    // Flag to enable resource creation throttling during cluster strain
 	CurrentClusterStrain             *util.ClusterStrainInfo // Current cluster strain state (updated by resource optimization)
-	ExcludedNamespaces               []string             // Namespaces to exclude from prefix-based discovery
+	ExcludedNamespaces               []string                // Namespaces to exclude from prefix-based discovery
 }
 
 // NewHealer initializes the Kubernetes client configuration using kubeconfig or in-cluster settings.
@@ -92,30 +92,30 @@ func NewHealer(kubeconfigPath string, namespaces []string, enableVMHealing bool,
 	}
 
 	healer := &Healer{
-		ClientSet:                  clientset,
-		DynamicClient:              dynamicClient,
-		Namespaces:                 namespaces,
-		StopCh:                     make(chan struct{}),
-		HealedPods:                 make(map[string]time.Time),
-		HealedNodes:                make(map[string]time.Time),
-		HealedVMs:                  make(map[string]time.Time),
-		HealedCRDs:                 make(map[string]time.Time),
-		TrackedCRDs:                make(map[string]bool),
-		HealCooldown:               10 * time.Minute, // default cooldown
-		EnableVMHealing:            enableVMHealing,
-		EnableCRDCleanup:           enableCRDCleanup,
-		CRDResources:               crdResources,
-		StaleAge:                   6 * time.Minute,                    // default stale age
-		CleanupFinalizers:          true,                               // default to cleaning up finalizers
-		EnableResourceOptimization: true,                               // default to enabled
-		StrainThreshold:            util.DefaultClusterStrainThreshold, // default 30%
-		OptimizedPods:              make(map[string]time.Time),
-		EnableNamespacePolling:          enableNamespacePolling,
-		NamespacePattern:                namespacePattern,
-		NamespacePollInterval:           namespacePollInterval,
-		WatchedNamespaces:               watchedNamespaces,
+		ClientSet:                        clientset,
+		DynamicClient:                    dynamicClient,
+		Namespaces:                       namespaces,
+		StopCh:                           make(chan struct{}),
+		HealedPods:                       make(map[string]time.Time),
+		HealedNodes:                      make(map[string]time.Time),
+		HealedVMs:                        make(map[string]time.Time),
+		HealedCRDs:                       make(map[string]time.Time),
+		TrackedCRDs:                      make(map[string]bool),
+		HealCooldown:                     10 * time.Minute, // default cooldown
+		EnableVMHealing:                  enableVMHealing,
+		EnableCRDCleanup:                 enableCRDCleanup,
+		CRDResources:                     crdResources,
+		StaleAge:                         6 * time.Minute,                    // default stale age
+		CleanupFinalizers:                true,                               // default to cleaning up finalizers
+		EnableResourceOptimization:       true,                               // default to enabled
+		StrainThreshold:                  util.DefaultClusterStrainThreshold, // default 30%
+		OptimizedPods:                    make(map[string]time.Time),
+		EnableNamespacePolling:           enableNamespacePolling,
+		NamespacePattern:                 namespacePattern,
+		NamespacePollInterval:            namespacePollInterval,
+		WatchedNamespaces:                watchedNamespaces,
 		EnableResourceCreationThrottling: true, // default to enabled
-		CurrentClusterStrain:            nil,  // Will be updated by resource optimization checks
+		CurrentClusterStrain:             nil,  // Will be updated by resource optimization checks
 		ExcludedNamespaces:               excludedNamespaces,
 	}
 
@@ -150,7 +150,7 @@ func (h *Healer) DisplayClusterInfo(config *rest.Config, kubeconfigPath string) 
 		// For fake clientset in tests, skip version check
 		err = fmt.Errorf("cannot get server version from fake clientset")
 	}
-	
+
 	if err == nil && serverVersion != nil {
 		output("📦 Kubernetes Version: %s\n", serverVersion.GitVersion)
 		output("   Platform: %s/%s\n", serverVersion.Platform, serverVersion.GoVersion)
@@ -335,8 +335,9 @@ func (h *Healer) Watch() {
 
 // watchSingleNamespace sets up a Pod Informer for one namespace.
 func (h *Healer) watchSingleNamespace(namespace string) {
-	// Create a SharedInformerFactory scoped to the namespace, with a 30s resync period
-	factory := informers.NewSharedInformerFactoryWithOptions(h.ClientSet, time.Second*30, informers.WithNamespace(namespace))
+	// Create a SharedInformerFactory scoped to the namespace, with a 5m resync period
+	// Increased from 30s to reduce memory churn and improve performance
+	factory := informers.NewSharedInformerFactoryWithOptions(h.ClientSet, 5*time.Minute, informers.WithNamespace(namespace))
 
 	// Get the Pod Informer
 	podInformer := factory.Core().V1().Pods().Informer()
@@ -409,7 +410,8 @@ func (h *Healer) checkAndHealPod(pod *v1.Pod) {
 }
 
 func (h *Healer) startHealCacheCleaner() {
-	ticker := time.NewTicker(30 * time.Minute)
+	// Run cleanup every 15 minutes to prevent unbounded map growth
+	ticker := time.NewTicker(15 * time.Minute)
 	go func() {
 		for {
 			select {
@@ -445,6 +447,20 @@ func (h *Healer) startHealCacheCleaner() {
 						delete(h.OptimizedPods, key)
 					}
 				}
+				// Limit TrackedCRDs map size to prevent unbounded growth
+				// If map exceeds 10000 entries, remove 20% of entries
+				// This prevents memory from growing unbounded in long-running processes
+				if len(h.TrackedCRDs) > 10000 {
+					removed := 0
+					targetRemoval := len(h.TrackedCRDs) / 5 // Remove 20%
+					for key := range h.TrackedCRDs {
+						if removed >= targetRemoval {
+							break
+						}
+						delete(h.TrackedCRDs, key)
+						removed++
+					}
+				}
 			case <-h.StopCh:
 				ticker.Stop()
 				return
@@ -472,7 +488,8 @@ func (h *Healer) triggerPodDeletion(pod *v1.Pod) {
 // watchNodes sets up a Node Informer to monitor node health
 func (h *Healer) watchNodes() {
 	// Create a SharedInformerFactory for nodes (cluster-scoped)
-	factory := informers.NewSharedInformerFactory(h.ClientSet, time.Second*30)
+	// Increased resync period to 5m to reduce memory churn
+	factory := informers.NewSharedInformerFactory(h.ClientSet, 5*time.Minute)
 
 	// Get the Node Informer
 	nodeInformer := factory.Core().V1().Nodes().Informer()
@@ -646,7 +663,7 @@ func (h *Healer) checkAllVirtualMachines() {
 // checkAndHealVirtualMachine checks a VirtualMachine's health and executes healing if necessary
 func (h *Healer) checkAndHealVirtualMachine(vm *unstructured.Unstructured) {
 	vmKey := fmt.Sprintf("%s/%s", vm.GetNamespace(), vm.GetName())
-	
+
 	// Continue monitoring VM health (for logging purposes)
 	isUnhealthy := util.IsVirtualMachineUnhealthy(vm)
 	if isUnhealthy {
@@ -678,7 +695,7 @@ func (h *Healer) checkAndHealVirtualMachine(vm *unstructured.Unstructured) {
 	// This allows tests to do self-cleanup, but cleans up truly stale VMs
 	vmAge := time.Since(vm.GetCreationTimestamp().Time)
 	vmMaxAge := 6 * time.Minute
-	
+
 	if vmAge > vmMaxAge {
 		fmt.Printf("\n!!! VM CLEANUP ACTION REQUIRED !!!\n")
 		fmt.Printf("    VM: %s\n", vmKey)
@@ -848,7 +865,7 @@ func (h *Healer) checkAndCleanupCRDResource(resource *unstructured.Unstructured,
 	if gvr.Resource == "virtualmachines" && gvr.Group == "kubevirt.io" {
 		vmAge := time.Since(resource.GetCreationTimestamp().Time)
 		vmMaxAge := 6 * time.Minute
-		
+
 		if vmAge > vmMaxAge {
 			reason := fmt.Sprintf("VM older than age threshold (%v old, threshold: %v)", vmAge.Round(time.Second), vmMaxAge)
 			fmt.Printf("\n!!! CRD CLEANUP ACTION REQUIRED !!!\n")
@@ -992,7 +1009,7 @@ func (h *Healer) checkAndOptimizeResources() {
 
 	// Check cluster strain
 	strainInfo := util.IsClusterUnderStrain(nodeList, h.StrainThreshold)
-	
+
 	// Update current cluster strain state for throttling checks
 	h.CurrentClusterStrain = &strainInfo
 
@@ -1193,7 +1210,7 @@ func (h *Healer) evictPodForOptimization(pod *v1.Pod, strainInfo util.ClusterStr
 // pollForNewNamespaces periodically checks for new namespaces matching the pattern
 func (h *Healer) pollForNewNamespaces() {
 	if h.NamespacePollInterval == 0 {
-		h.NamespacePollInterval = 30 * time.Second // Default poll interval
+		h.NamespacePollInterval = 5 * time.Second // Default poll interval
 	}
 
 	ticker := time.NewTicker(h.NamespacePollInterval)
@@ -1232,19 +1249,19 @@ func (h *Healer) pollForNewNamespaces() {
 // Returns a map of prefix -> true to avoid duplicates.
 func (h *Healer) extractPrefixesFromNamespaces() map[string]bool {
 	prefixes := make(map[string]bool)
-	
+
 	for _, ns := range h.Namespaces {
 		// Skip wildcard patterns (they're handled separately)
 		if strings.Contains(ns, "*") {
 			continue
 		}
-		
+
 		// Extract prefix: find the last separator (hyphen, underscore, or dot)
 		// and use everything before it as the prefix
 		lastHyphen := strings.LastIndex(ns, "-")
 		lastUnderscore := strings.LastIndex(ns, "_")
 		lastDot := strings.LastIndex(ns, ".")
-		
+
 		lastSeparator := -1
 		if lastHyphen > lastSeparator {
 			lastSeparator = lastHyphen
@@ -1255,14 +1272,14 @@ func (h *Healer) extractPrefixesFromNamespaces() map[string]bool {
 		if lastDot > lastSeparator {
 			lastSeparator = lastDot
 		}
-		
+
 		// If we found a separator, extract the prefix
 		if lastSeparator > 0 && lastSeparator < len(ns)-1 {
 			prefix := ns[:lastSeparator+1] // Include the separator
 			prefixes[prefix] = true
 		}
 	}
-	
+
 	return prefixes
 }
 
@@ -1324,7 +1341,7 @@ func (h *Healer) discoverNewNamespaces() {
 				break // Found a match, no need to check other patterns
 			}
 		}
-		
+
 		// Check against prefixes (if not already matched)
 		if !matchedNamespaces[ns.Name] {
 			for prefix := range prefixes {
@@ -1361,7 +1378,7 @@ func (h *Healer) discoverNewNamespaces() {
 		if existingNamespaces[watchedNs] {
 			continue
 		}
-		
+
 		// Check if it matches any pattern (wildcard)
 		matchesPattern := false
 		for _, pattern := range patterns {
@@ -1371,7 +1388,7 @@ func (h *Healer) discoverNewNamespaces() {
 				break
 			}
 		}
-		
+
 		// Check if it matches any prefix (if not already matched by wildcard)
 		if !matchesPattern {
 			for prefix := range prefixes {
@@ -1381,7 +1398,7 @@ func (h *Healer) discoverNewNamespaces() {
 				}
 			}
 		}
-		
+
 		// Only remove if it matches the pattern (was dynamically discovered)
 		// Namespaces that don't match the pattern were explicitly specified and should be kept
 		if matchesPattern {
@@ -1393,11 +1410,11 @@ func (h *Healer) discoverNewNamespaces() {
 	if len(deletedNamespaces) > 0 {
 		fmt.Printf("   [INFO] 🗑️  Detected %d deleted namespace(s) matching pattern: [%s]\n",
 			len(deletedNamespaces), strings.Join(deletedNamespaces, ", "))
-		
+
 		for _, nsName := range deletedNamespaces {
 			// Remove from watched namespaces map
 			delete(h.WatchedNamespaces, nsName)
-			
+
 			// Remove from Namespaces list
 			for i, ns := range h.Namespaces {
 				if ns == nsName {
@@ -1405,7 +1422,7 @@ func (h *Healer) discoverNewNamespaces() {
 					break
 				}
 			}
-			
+
 			fmt.Printf("   [INFO] ⏹️  Stopped watching deleted namespace: %s\n", nsName)
 		}
 	}
@@ -1484,6 +1501,17 @@ func (h *Healer) checkAndDeleteStaleNamespaces(namespaces []v1.Namespace, patter
 
 		// Only check age for namespaces that match the pattern
 		if matchesPattern {
+			// Check if namespace is stuck in Terminating state (regardless of age)
+			if ns.Status.Phase == v1.NamespaceTerminating && ns.DeletionTimestamp != nil {
+				// If it's been terminating for more than 2 minutes, consider it stuck
+				terminatingDuration := now.Sub(ns.DeletionTimestamp.Time)
+				if terminatingDuration > 2*time.Minute {
+					staleNamespaces = append(staleNamespaces, ns)
+					continue
+				}
+			}
+
+			// Check if namespace is older than the stale age threshold
 			nsAge := now.Sub(ns.CreationTimestamp.Time)
 			if nsAge > h.StaleAge {
 				staleNamespaces = append(staleNamespaces, ns)
@@ -1516,58 +1544,131 @@ func (h *Healer) triggerNamespaceDeletion(ns *v1.Namespace) {
 	fmt.Printf("    Namespace: %s\n", ns.Name)
 	fmt.Printf("    Age: %v (threshold: %v)\n", nsAge.Round(time.Second), h.StaleAge)
 
+	// Check if namespace is already in Terminating state (might be stuck with finalizers)
+	if ns.Status.Phase == v1.NamespaceTerminating {
+		fmt.Printf("   [INFO] 🔍 Namespace %s is already in Terminating state\n", ns.Name)
+
+		// If cleanup finalizers is enabled, try to remove finalizers to unstick it
+		if h.CleanupFinalizers && len(ns.Finalizers) > 0 {
+			fmt.Printf("   [INFO] 🔄 Removing finalizers from namespace %s to unstick deletion...\n", ns.Name)
+
+			// Get the current namespace to update
+			currentNs, err := h.ClientSet.CoreV1().Namespaces().Get(ctx, ns.Name, metav1.GetOptions{})
+			if err != nil {
+				if apierrors.IsNotFound(err) {
+					fmt.Printf("   [SKIP] ⏭️ Namespace %s was already deleted\n", ns.Name)
+					h.removeNamespaceFromTracking(ns.Name)
+					return
+				}
+				fmt.Printf("   [WARN] ⚠️ Failed to get namespace %s for finalizer removal: %v\n", ns.Name, err)
+			} else {
+				// Remove all finalizers
+				currentNs.Finalizers = []string{}
+				_, err = h.ClientSet.CoreV1().Namespaces().Update(ctx, currentNs, metav1.UpdateOptions{})
+				if err != nil {
+					if apierrors.IsNotFound(err) {
+						fmt.Printf("   [SKIP] ⏭️ Namespace %s was deleted during finalizer removal\n", ns.Name)
+						h.removeNamespaceFromTracking(ns.Name)
+						return
+					}
+					fmt.Printf("   [WARN] ⚠️ Failed to remove finalizers from namespace %s: %v\n", ns.Name, err)
+				} else {
+					fmt.Printf("   [SUCCESS] ✅ Removed finalizers from namespace %s\n", ns.Name)
+					// Finalizers removed, namespace should complete deletion now
+					h.removeNamespaceFromTracking(ns.Name)
+					fmt.Printf("!!! NAMESPACE CLEANUP ACTION COMPLETE !!!\n\n")
+					return
+				}
+			}
+		} else {
+			// Namespace is terminating but we can't remove finalizers, just wait
+			fmt.Printf("   [INFO] ⏳ Namespace %s is terminating (finalizers: %v)\n", ns.Name, ns.Finalizers)
+			return
+		}
+	}
+
+	// If cleanup finalizers is enabled and namespace has finalizers, remove them first
+	if h.CleanupFinalizers && len(ns.Finalizers) > 0 {
+		fmt.Printf("   [INFO] 🔄 Removing finalizers from namespace %s...\n", ns.Name)
+
+		// Get the current namespace to update
+		currentNs, err := h.ClientSet.CoreV1().Namespaces().Get(ctx, ns.Name, metav1.GetOptions{})
+		if err != nil {
+			if apierrors.IsNotFound(err) {
+				fmt.Printf("   [SKIP] ⏭️ Namespace %s was already deleted\n", ns.Name)
+				h.removeNamespaceFromTracking(ns.Name)
+				return
+			}
+			fmt.Printf("   [WARN] ⚠️ Failed to get namespace %s for finalizer removal: %v\n", ns.Name, err)
+			fmt.Printf("   [INFO] 🔄 Proceeding with deletion anyway...\n")
+		} else {
+			// Remove all finalizers
+			currentNs.Finalizers = []string{}
+			_, err = h.ClientSet.CoreV1().Namespaces().Update(ctx, currentNs, metav1.UpdateOptions{})
+			if err != nil {
+				if apierrors.IsNotFound(err) {
+					fmt.Printf("   [SKIP] ⏭️ Namespace %s was deleted during finalizer removal\n", ns.Name)
+					h.removeNamespaceFromTracking(ns.Name)
+					return
+				}
+				fmt.Printf("   [WARN] ⚠️ Failed to remove finalizers from namespace %s: %v\n", ns.Name, err)
+				fmt.Printf("   [INFO] 🔄 Proceeding with deletion anyway...\n")
+			} else {
+				fmt.Printf("   [SUCCESS] ✅ Removed finalizers from namespace %s\n", ns.Name)
+			}
+		}
+	}
+
+	// Attempt to delete the namespace
 	err := h.ClientSet.CoreV1().Namespaces().Delete(ctx, ns.Name, metav1.DeleteOptions{})
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			fmt.Printf("   [SKIP] ⏭️ Namespace %s was already deleted\n", ns.Name)
-			// Remove from tracking if it was already deleted
-			delete(h.WatchedNamespaces, ns.Name)
-			for i, watchedNs := range h.Namespaces {
-				if watchedNs == ns.Name {
-					h.Namespaces = append(h.Namespaces[:i], h.Namespaces[i+1:]...)
-					break
-				}
-			}
+			h.removeNamespaceFromTracking(ns.Name)
 		} else {
 			fmt.Printf("   [FAIL] ❌ Failed to delete namespace %s: %v\n", ns.Name, err)
 		}
 	} else {
 		fmt.Printf("   [SUCCESS] ✅ Deleted stale namespace %s\n", ns.Name)
-		// Remove from tracking
-		delete(h.WatchedNamespaces, ns.Name)
-		for i, watchedNs := range h.Namespaces {
-			if watchedNs == ns.Name {
-				h.Namespaces = append(h.Namespaces[:i], h.Namespaces[i+1:]...)
-				break
-			}
-		}
+		h.removeNamespaceFromTracking(ns.Name)
 	}
 
 	fmt.Printf("!!! NAMESPACE CLEANUP ACTION COMPLETE !!!\n\n")
+}
+
+// removeNamespaceFromTracking removes a namespace from tracking maps and lists
+func (h *Healer) removeNamespaceFromTracking(nsName string) {
+	delete(h.WatchedNamespaces, nsName)
+	for i, watchedNs := range h.Namespaces {
+		if watchedNs == nsName {
+			h.Namespaces = append(h.Namespaces[:i], h.Namespaces[i+1:]...)
+			break
+		}
+	}
 }
 
 // isTestNamespace checks if a namespace matches the test namespace pattern
 func (h *Healer) isTestNamespace(namespace string) bool {
 	// Build list of patterns to check
 	patterns := []string{}
-	
+
 	// Add explicit pattern if set
 	if h.NamespacePattern != "" {
 		patterns = append(patterns, h.NamespacePattern)
 	}
-	
+
 	// Extract wildcard patterns from Namespaces list (from --namespaces flag)
 	for _, ns := range h.Namespaces {
 		if strings.Contains(ns, "*") {
 			patterns = append(patterns, ns)
 		}
 	}
-	
+
 	// If no patterns found, don't assume test namespaces
 	if len(patterns) == 0 {
 		return false
 	}
-	
+
 	// Check against all patterns
 	for _, pattern := range patterns {
 		matched, err := filepath.Match(pattern, namespace)
@@ -1589,7 +1690,7 @@ func (h *Healer) handleResourceCreation(resourceType, namespace, name string) {
 	if h.CurrentClusterStrain != nil && h.CurrentClusterStrain.HasStrain {
 		// Check if this is a test namespace (test resources are allowed)
 		isTestNamespace := h.isTestNamespace(namespace)
-		
+
 		if isTestNamespace {
 			// Test namespace resources - warn but allow (tests need to run)
 			fmt.Printf("   [WARN] ⚠️ New %s created in test namespace during cluster strain: %s/%s (strain: %.1f%%)\n",

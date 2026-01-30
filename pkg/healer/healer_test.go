@@ -57,7 +57,7 @@ func createTestHealerWithExclusions(namespaces []string, excludedNamespaces []st
 		OptimizedPods:              make(map[string]time.Time),
 		EnableNamespacePolling:     false,
 		NamespacePattern:           "",
-		NamespacePollInterval:      30 * time.Second,
+		NamespacePollInterval:      5 * time.Second,
 		WatchedNamespaces:          watchedNamespaces,
 		EnableResourceCreationThrottling: true,
 		CurrentClusterStrain:       nil,

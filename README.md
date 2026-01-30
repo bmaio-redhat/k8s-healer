@@ -203,7 +203,7 @@ test pods have the best possible resource allocation.
 - **Snapshots & Clones:** VirtualMachineSnapshots, VirtualMachineClones
 - **Instance Types:** VirtualMachineInstanceTypes, VirtualMachineClusterInstanceTypes
 - **Preferences:** VirtualMachinePreferences, VirtualMachineClusterPreferences
-- **Migration:** MigrationPolicies
+- **Migration:** MigrationPolicies, VirtualMachineMigrationPlans
 - **Networking:** NetworkAttachmentDefinitions, UserDefinedNetworks, ClusterUserDefinedNetworks
 - **OpenShift:** Templates
 
@@ -289,6 +289,91 @@ go mod tidy
 go build -o k8s-healer ./cmd/main.go
 ```
 
+### 🐳 Docker / Podman
+
+k8s-healer can be run as a container using Docker or Podman, providing a lightweight, isolated environment. The container image uses a minimal `scratch` base image for the smallest possible footprint.
+
+**Note:** All examples use `docker` commands, but they work identically with `podman` - simply replace `docker` with `podman` in any command.
+
+#### Building the Container Image
+
+```bash
+# Build the container image with Docker
+docker build -t k8s-healer .
+
+# Or build with Podman (identical command)
+podman build -t k8s-healer .
+```
+
+#### Running the Container
+
+**Easy Way (Recommended):** Use the `docker-k8s-healer.sh` wrapper script to automatically handle volume mounting. This allows you to use the same flags as the native binary without manually specifying the `-v` flag. The script automatically prefers Podman and falls back to Docker if Podman is not available:
+
+```bash
+# Use the wrapper script - automatically handles volume mounting and container runtime detection
+./docker-k8s-healer.sh -k /path/to/kubeconfig -n "pw-*" -e "pw-test-ns"
+
+# Explicitly use Podman (overrides auto-detection)
+./docker-k8s-healer.sh podman -k /path/to/kubeconfig -n "pw-*" -e "pw-test-ns"
+
+# Explicitly use Docker (overrides auto-detection)
+./docker-k8s-healer.sh docker -k /path/to/kubeconfig -n "pw-*" -e "pw-test-ns"
+
+# Run as daemon
+./docker-k8s-healer.sh -k /path/to/kubeconfig --daemon -n "pw-*"
+```
+
+**Manual Way:** Mount your kubeconfig file manually using the `-v` flag. Mount to `/root/.kube/config` (the default location) to avoid needing the `-k` flag.
+
+**Important:** All examples use the `--rm` flag to automatically remove the container when it exits or is stopped (e.g., with `Ctrl+C`). All `docker` commands can be replaced with `podman` for identical functionality.
+
+**Manual Docker/Podman Examples (if not using wrapper script):**
+
+```bash
+# Basic usage - mount to default location, no -k flag needed
+docker run --rm -v ~/.kube/config:/root/.kube/config:ro k8s-healer
+
+# Watch namespaces - mount custom kubeconfig to default location
+docker run --rm -v /path/to/kubeconfig:/root/.kube/config:ro k8s-healer -n "pw-*"
+
+# Watch namespaces and exclude specific ones
+docker run --rm -v ~/.kube/config:/root/.kube/config:ro k8s-healer -n "pw-*" -e "pw-test-ns"
+
+# Full example with custom kubeconfig path (mounted to default location)
+docker run --rm -v /home/user/.kubeconfigs/test-config:/root/.kube/config:ro k8s-healer -n "pw-*" -e "pw-test-ns"
+
+# Run as daemon (background mode)
+docker run -d --rm --name k8s-healer -v ~/.kube/config:/root/.kube/config:ro k8s-healer --daemon -n "pw-*"
+
+# Discover cluster endpoints
+docker run --rm -v ~/.kube/config:/root/.kube/config:ro k8s-healer --discover
+```
+
+**Note:** Replace `docker` with `podman` in any command above for Podman usage.
+
+#### Container Management
+
+```bash
+# Stop a running container (if running in daemon mode)
+docker stop k8s-healer
+# Or with Podman:
+podman stop k8s-healer
+
+# View container logs (if running in daemon mode)
+docker logs k8s-healer
+# Or with Podman:
+podman logs k8s-healer
+
+# Follow container logs in real-time
+docker logs -f k8s-healer
+# Or with Podman:
+podman logs -f k8s-healer
+```
+
+**Note:** The `--rm` flag ensures containers are automatically cleaned up when they exit, preventing accumulation of stopped containers. This is especially useful when running the tool interactively or in CI/CD pipelines.
+
+**Podman Compatibility:** Podman is fully compatible with all Docker commands shown above. Simply replace `docker` with `podman` in any command. Podman is daemonless and rootless by default, making it ideal for environments where Docker daemon access is restricted.
+
 ### ▶️ Run
 
 By default, the tool authenticates using your local **Kubeconfig** file
@@ -362,9 +447,9 @@ By default, the tool authenticates using your local **Kubeconfig** file
                            if `--enable-namespace-polling`    
                            is set.                            
 
-  `--namespace-poll-interval` How often to poll for new       `--namespace-poll-interval 30s`
-                             namespaces (e.g., 30s, 1m).      
-                             Default: `30s`.                  
+  `--namespace-poll-interval` How often to poll for new       `--namespace-poll-interval 5s`
+                             namespaces (e.g., 5s, 1m).      
+                             Default: `5s`.                  
 
   `--exclude-namespaces`, `-e` Comma-separated list of       `--exclude-namespaces test-keep,test-important`
                              namespaces to exclude from       `-e test-keep`
@@ -693,7 +778,7 @@ You can specify a different source kubeconfig location using the `--source-kubec
    • CRD Cleanup: ✅ Enabled (15 resource types)
    • Resource Optimization: ✅ Enabled (threshold: 30.0%)
    • Resource Creation Throttling: ✅ Enabled
-   • Namespace Polling: ✅ Enabled (pattern: test-*, interval: 30s)
+   • Namespace Polling: ✅ Enabled (pattern: test-*, interval: 5s)
 
 🔧 Configuration:
    • Stale Age Threshold: 6m0s
@@ -797,7 +882,7 @@ You can specify a different source kubeconfig location using the `--source-kubec
     !!! RESOURCE OPTIMIZATION ACTION COMPLETE !!!
 
 ### Namespace Management
-    [INFO] 🔍 Starting namespace polling for pattern: test-* (interval: 30s)
+    [INFO] 🔍 Starting namespace polling for pattern: test-* (interval: 5s)
     [INFO] ✨ Discovered 2 new namespace(s) matching pattern 'test-*': [test-456, test-789]
     [INFO] ✅ Started watching new namespace: test-456
     [INFO] ✅ Started watching new namespace: test-789
@@ -813,7 +898,7 @@ You can specify a different source kubeconfig location using the `--source-kubec
     !!! NAMESPACE CLEANUP ACTION COMPLETE !!!
     
     [MONITOR] 🔍 Pod test-keep/unhealthy-pod is unhealthy (CrashLoopBackOff) but namespace is excluded from deletion
-    [MONITOR] 🔍 VM test-important/old-vm is older than threshold (10m0s) but namespace is excluded from deletion
+    [MONITOR] 🔍 VM test-important/old-vm is older than threshold (6m0s) but namespace is excluded from deletion
 
 ### Resource Creation Throttling
     [INFO] ⚠️ Cluster under strain: 35.0% of nodes (2/6) under resource pressure
@@ -909,8 +994,9 @@ The CRD cleanup feature is particularly useful for:
 -   `virtualmachinepreferences.instancetype.kubevirt.io/v1beta1` - Namespace-scoped preferences
 -   `virtualmachineclusterpreferences.instancetype.kubevirt.io/v1beta1` - Cluster-scoped preferences
 
-**Migration Policies:**
+**Migration Policies & Plans:**
 -   `migrationpolicies.migrations.kubevirt.io/v1alpha1` - Migration policies
+-   `virtualmachinemigrationplans.kubevirt.io/v1alpha1` - VM migration plans
 
 **Network Resources:**
 -   `network-attachment-definitions.k8s.cni.cncf.io/v1` - Network attachment definitions
