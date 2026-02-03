@@ -3,6 +3,7 @@ package healthcheck
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -65,17 +66,36 @@ func PerformClusterHealthCheck(clientset kubernetes.Interface, dynamicClient dyn
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	// Check Kubernetes API server
-	status.KubernetesAPI = checkKubernetesAPI(ctx, clientset)
+	// Run health checks in parallel for better performance
+	var wg sync.WaitGroup
+	var kubernetesAPI HealthCheckResult
+	var kubeVirtCRDs []HealthCheckResult
+	var kubeVirtAPI HealthCheckResult
+	var keyResources []HealthCheckResult
 
-	// Check KubeVirt CRDs
-	status.KubeVirtCRDs = checkKubeVirtCRDs(ctx, dynamicClient)
+	wg.Add(4)
+	go func() {
+		defer wg.Done()
+		kubernetesAPI = checkKubernetesAPI(ctx, clientset)
+	}()
+	go func() {
+		defer wg.Done()
+		kubeVirtCRDs = checkKubeVirtCRDs(ctx, dynamicClient)
+	}()
+	go func() {
+		defer wg.Done()
+		kubeVirtAPI = checkKubeVirtAPI(ctx, clientset, config)
+	}()
+	go func() {
+		defer wg.Done()
+		keyResources = checkKeyResources(ctx, clientset, dynamicClient)
+	}()
+	wg.Wait()
 
-	// Check KubeVirt API endpoints
-	status.KubeVirtAPI = checkKubeVirtAPI(ctx, clientset, config)
-
-	// Check key resource accessibility
-	status.KeyResources = checkKeyResources(ctx, clientset, dynamicClient)
+	status.KubernetesAPI = kubernetesAPI
+	status.KubeVirtCRDs = kubeVirtCRDs
+	status.KubeVirtAPI = kubeVirtAPI
+	status.KeyResources = keyResources
 
 	// Calculate overall status
 	status.TotalChecks = 1 + len(status.KubeVirtCRDs) + 1 + len(status.KeyResources)

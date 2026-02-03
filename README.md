@@ -91,6 +91,9 @@ suitable for both local development, test environments, and production environme
 -   **Endpoint Discovery:** Discover and display all available API endpoints
     and resources in the cluster using the `--discover` flag. Useful for exploring
     cluster capabilities and verifying API group availability.\
+-   **Cluster Warm-up:** Validates CRD availability and API connectivity before
+    starting heavy operations. Useful for ensuring the cluster is ready before
+    automated tests begin creating many concurrent resources.\
 -   **Pluggable Architecture:** Easy to extend with new failure
     detection logic or healing strategies.
 
@@ -231,6 +234,46 @@ This comprehensive list ensures all resources created during Playwright test run
 5.  **Test Environment Stability:**\
     By continuously cleaning up stale resources, tests can run smoothly
     without interference from leftover test artifacts.
+
+### Cluster Warm-up (Pre-Test Preparation)
+
+Before starting heavy operations (like automated tests that create many concurrent CRDs), k8s-healer can warm up the cluster to ensure it's ready:
+
+1.  **API Connectivity Check:**\
+    Validates that the Kubernetes API server is accessible and responsive.
+
+2.  **CRD Availability Validation:**\
+    Checks that all configured CRD resource types are available in the cluster.
+    This ensures that when tests begin creating resources, the CRDs are already
+    registered and ready.
+
+3.  **Readiness Confirmation:**\
+    Performs final connectivity checks to confirm the cluster is ready for
+    heavy concurrent operations.
+
+**Use Cases:**
+- **Pre-Test Validation:** Run warm-up before automated test suites to ensure
+  the cluster is ready for concurrent resource creation.
+- **CI/CD Pipelines:** Validate cluster readiness before starting parallel test
+  execution.
+- **Development Workflows:** Ensure all required CRDs are available before
+  running resource-intensive operations.
+
+**Example:**
+```bash
+# Warm up cluster with 30 second timeout (default)
+./k8s-healer --warmup-timeout 30s -n "test-*"
+
+# Custom warm-up timeout
+./k8s-healer --warmup-timeout 1m -n "test-*"
+
+# Disable warm-up (skip validation)
+./k8s-healer --warmup-timeout 0 -n "test-*"
+```
+
+**Note:** If warm-up detects unavailable CRDs, it will warn but continue.
+This allows the healer to start even if some CRDs are still being installed,
+as they may become available later.
 
 ### Namespace Management Workflow (Test Environments)
 
@@ -471,6 +514,15 @@ By default, the tool authenticates using your local **Kubeconfig** file
                                           cluster, then exit.  
                                           Useful for exploring 
                                           cluster capabilities.
+
+  `-w, --warmup-timeout`                 Timeout for cluster warm-up       `-w 30s`
+                                          phase. Validates CRD                `--warmup-timeout 0` (disable)
+                                          availability and API                
+                                          connectivity before                 
+                                          starting heavy operations.          
+                                          Useful before automated             
+                                          tests begin. Default: `30s`.       
+                                          Set to `0` to disable.
   
 ------------------------------------------------------------------------
 
@@ -579,6 +631,17 @@ By default, the tool authenticates using your local **Kubeconfig** file
 
 # Discover endpoints and filter for KubeVirt-specific resources
 ./k8s-healer --discover | grep -A 20 "KubeVirt"
+
+# Warm up cluster before heavy operations (validates CRD availability)
+./k8s-healer -w 30s -n "test-*"
+# Or use long form:
+./k8s-healer --warmup-timeout 30s -n "test-*"
+
+# Custom warm-up timeout
+./k8s-healer -w 1m -n "test-*"
+
+# Disable warm-up (skip validation)
+./k8s-healer -w 0 -n "test-*"
 
 # Watch namespaces with prefix-based discovery and exclude specific namespaces from deletion
 ./k8s-healer -n test-123 -e test-keep,test-important

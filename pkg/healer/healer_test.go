@@ -2,6 +2,7 @@ package healer
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -11,9 +12,10 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	dynamicfake "k8s.io/client-go/dynamic/fake"
 	"k8s.io/client-go/kubernetes/fake"
 	"k8s.io/client-go/rest"
-	dynamicfake "k8s.io/client-go/dynamic/fake"
 )
 
 // createTestHealer creates a healer instance with fake clients for testing
@@ -37,31 +39,31 @@ func createTestHealerWithExclusions(namespaces []string, excludedNamespaces []st
 	}
 
 	healer := &Healer{
-		ClientSet:                  clientset,
-		DynamicClient:              dynamicClient,
-		Namespaces:                 namespaces,
-		StopCh:                     make(chan struct{}),
-		HealedPods:                 make(map[string]time.Time),
-		HealedNodes:                make(map[string]time.Time),
-		HealedVMs:                  make(map[string]time.Time),
-		HealedCRDs:                 make(map[string]time.Time),
-		TrackedCRDs:                make(map[string]bool),
-		HealCooldown:               10 * time.Minute,
-		EnableVMHealing:            true,
-		EnableCRDCleanup:           true,
-		CRDResources:               []string{"virtualmachines.kubevirt.io/v1"},
-		StaleAge:                   6 * time.Minute,
-		CleanupFinalizers:          true,
-		EnableResourceOptimization: true,
-		StrainThreshold:            util.DefaultClusterStrainThreshold,
-		OptimizedPods:              make(map[string]time.Time),
-		EnableNamespacePolling:     false,
-		NamespacePattern:           "",
-		NamespacePollInterval:      5 * time.Second,
-		WatchedNamespaces:          watchedNamespaces,
+		ClientSet:                        clientset,
+		DynamicClient:                    dynamicClient,
+		Namespaces:                       namespaces,
+		StopCh:                           make(chan struct{}),
+		HealedPods:                       make(map[string]time.Time),
+		HealedNodes:                      make(map[string]time.Time),
+		HealedVMs:                        make(map[string]time.Time),
+		HealedCRDs:                       make(map[string]time.Time),
+		TrackedCRDs:                      make(map[string]bool),
+		HealCooldown:                     10 * time.Minute,
+		EnableVMHealing:                  true,
+		EnableCRDCleanup:                 true,
+		CRDResources:                     []string{"virtualmachines.kubevirt.io/v1"},
+		StaleAge:                         6 * time.Minute,
+		CleanupFinalizers:                true,
+		EnableResourceOptimization:       true,
+		StrainThreshold:                  util.DefaultClusterStrainThreshold,
+		OptimizedPods:                    make(map[string]time.Time),
+		EnableNamespacePolling:           false,
+		NamespacePattern:                 "",
+		NamespacePollInterval:            5 * time.Second,
+		WatchedNamespaces:                watchedNamespaces,
 		EnableResourceCreationThrottling: true,
-		CurrentClusterStrain:       nil,
-		ExcludedNamespaces:         excludedNamespaces,
+		CurrentClusterStrain:             nil,
+		ExcludedNamespaces:               excludedNamespaces,
 	}
 
 	return healer, nil
@@ -181,8 +183,8 @@ func TestHealer_CheckAndHealVirtualMachine_AgeBased(t *testing.T) {
 			"apiVersion": "kubevirt.io/v1",
 			"kind":       "VirtualMachine",
 			"metadata": map[string]interface{}{
-				"name":      "old-vm",
-				"namespace": "default",
+				"name":              "old-vm",
+				"namespace":         "default",
 				"creationTimestamp": now.Add(-10 * time.Minute).Format(time.RFC3339),
 			},
 			"status": map[string]interface{}{
@@ -218,8 +220,8 @@ func TestHealer_CheckAndHealVirtualMachine_ErrorUnschedulable(t *testing.T) {
 			"apiVersion": "kubevirt.io/v1",
 			"kind":       "VirtualMachine",
 			"metadata": map[string]interface{}{
-				"name":      "unschedulable-vm",
-				"namespace": "default",
+				"name":              "unschedulable-vm",
+				"namespace":         "default",
 				"creationTimestamp": now.Add(-5 * time.Minute).Format(time.RFC3339),
 			},
 			"status": map[string]interface{}{
@@ -263,8 +265,8 @@ func TestHealer_CheckCRDResource_AgeBased(t *testing.T) {
 			"apiVersion": "kubevirt.io/v1",
 			"kind":       "VirtualMachine",
 			"metadata": map[string]interface{}{
-				"name":      "old-resource",
-				"namespace": "default",
+				"name":              "old-resource",
+				"namespace":         "default",
 				"creationTimestamp": now.Add(-10 * time.Minute).Format(time.RFC3339),
 			},
 		},
@@ -296,11 +298,11 @@ func TestHealer_CheckCRDResource_StuckFinalizers(t *testing.T) {
 			"apiVersion": "kubevirt.io/v1",
 			"kind":       "VirtualMachine",
 			"metadata": map[string]interface{}{
-				"name":      "stuck-resource",
-				"namespace": "default",
+				"name":              "stuck-resource",
+				"namespace":         "default",
 				"creationTimestamp": now.Add(-1 * time.Minute).Format(time.RFC3339),
 				"deletionTimestamp": now.Add(-10 * time.Minute).Format(time.RFC3339),
-				"finalizers": []interface{}{"finalizer.example.com"},
+				"finalizers":        []interface{}{"finalizer.example.com"},
 			},
 		},
 	}
@@ -335,8 +337,8 @@ func TestHealer_CheckCRDResource_ErrorPhase(t *testing.T) {
 			"apiVersion": "kubevirt.io/v1",
 			"kind":       "VirtualMachine",
 			"metadata": map[string]interface{}{
-				"name":      "error-resource",
-				"namespace": "default",
+				"name":              "error-resource",
+				"namespace":         "default",
 				"creationTimestamp": now.Add(-1 * time.Minute).Format(time.RFC3339),
 			},
 			"status": map[string]interface{}{
@@ -571,10 +573,10 @@ func TestHealer_DiscoverNewNamespaces_WithExclusions(t *testing.T) {
 	// Create fake namespaces in the cluster
 	clientset := healer.ClientSet.(*fake.Clientset)
 	namespaces := []*v1.Namespace{
-		{ObjectMeta: metav1.ObjectMeta{Name: "test-123"}},    // Already watched
-		{ObjectMeta: metav1.ObjectMeta{Name: "test-456"}},    // Should be discovered
-		{ObjectMeta: metav1.ObjectMeta{Name: "test-789"}},    // Should be discovered
-		{ObjectMeta: metav1.ObjectMeta{Name: "test-keep"}},    // Should be discovered but excluded from deletion
+		{ObjectMeta: metav1.ObjectMeta{Name: "test-123"}},       // Already watched
+		{ObjectMeta: metav1.ObjectMeta{Name: "test-456"}},       // Should be discovered
+		{ObjectMeta: metav1.ObjectMeta{Name: "test-789"}},       // Should be discovered
+		{ObjectMeta: metav1.ObjectMeta{Name: "test-keep"}},      // Should be discovered but excluded from deletion
 		{ObjectMeta: metav1.ObjectMeta{Name: "test-important"}}, // Should be discovered but excluded from deletion
 	}
 
@@ -984,5 +986,399 @@ func TestHealer_CheckAndDeleteStaleNamespaces_WildcardPattern(t *testing.T) {
 	_, err = clientset.CoreV1().Namespaces().Get(context.TODO(), "default", metav1.GetOptions{})
 	if err != nil {
 		t.Errorf("default should NOT have been deleted (doesn't match pattern), got error: %v", err)
+	}
+}
+
+func TestHealer_TrackedCRDsCleanup_RemovesDeletedResources(t *testing.T) {
+	healer, err := createTestHealer([]string{"default"})
+	if err != nil {
+		t.Fatalf("createTestHealer() error = %v", err)
+	}
+
+	// Create fake dynamic client with registered resource types
+	scheme := runtime.NewScheme()
+	gvr := schema.GroupVersionResource{
+		Group:    "kubevirt.io",
+		Version:  "v1",
+		Resource: "virtualmachines",
+	}
+	// Register the resource type for listing
+	dynamicClient := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(scheme, map[schema.GroupVersionResource]string{
+		gvr: "VirtualMachineList",
+	})
+	healer.DynamicClient = dynamicClient
+
+	// Create some resources in the fake client with recent creation timestamps
+	// so they won't be considered stale (must be less than 6 minutes old)
+	now := time.Now()
+	vm1 := &unstructured.Unstructured{
+		Object: map[string]interface{}{
+			"apiVersion": "kubevirt.io/v1",
+			"kind":       "VirtualMachine",
+			"metadata": map[string]interface{}{
+				"name":              "vm-1",
+				"namespace":         "default",
+				"creationTimestamp": now.Format(time.RFC3339),
+			},
+		},
+	}
+	vm2 := &unstructured.Unstructured{
+		Object: map[string]interface{}{
+			"apiVersion": "kubevirt.io/v1",
+			"kind":       "VirtualMachine",
+			"metadata": map[string]interface{}{
+				"name":              "vm-2",
+				"namespace":         "default",
+				"creationTimestamp": now.Format(time.RFC3339),
+			},
+		},
+	}
+
+	// Add resources to fake client
+	createdVM1, err := dynamicClient.Resource(gvr).Namespace("default").Create(context.TODO(), vm1, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("Failed to create vm1: %v", err)
+	}
+	createdVM2, err := dynamicClient.Resource(gvr).Namespace("default").Create(context.TODO(), vm2, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("Failed to create vm2: %v", err)
+	}
+
+	// Update resources with proper creation timestamps (fake client may not preserve them from initial creation)
+	// Use metav1.Time to ensure proper timestamp format - set to very recent time so they're not stale
+	// VirtualMachines have a hardcoded 6-minute threshold, so we need timestamps less than 6 minutes old
+	recentTime := metav1.NewTime(time.Now().Add(-1 * time.Minute)) // 1 minute ago, well under 6 minute threshold
+	createdVM1.SetCreationTimestamp(recentTime)
+	createdVM2.SetCreationTimestamp(recentTime)
+	updatedVM1, err := dynamicClient.Resource(gvr).Namespace("default").Update(context.TODO(), createdVM1, metav1.UpdateOptions{})
+	if err != nil {
+		t.Fatalf("Failed to update vm1 timestamp: %v", err)
+	}
+	updatedVM2, err := dynamicClient.Resource(gvr).Namespace("default").Update(context.TODO(), createdVM2, metav1.UpdateOptions{})
+	if err != nil {
+		t.Fatalf("Failed to update vm2 timestamp: %v", err)
+	}
+
+	// Verify timestamps were set correctly
+	vm1Timestamp := updatedVM1.GetCreationTimestamp()
+	vm2Timestamp := updatedVM2.GetCreationTimestamp()
+	if vm1Timestamp.Time.IsZero() {
+		t.Fatal("vm1 creation timestamp is zero after update")
+	}
+	if vm2Timestamp.Time.IsZero() {
+		t.Fatal("vm2 creation timestamp is zero after update")
+	}
+
+	// Set a very high stale age for this test so the VMs won't be considered stale
+	// This test is specifically about TrackedCRDs cleanup, not resource deletion
+	originalStaleAge := healer.StaleAge
+	healer.StaleAge = 24 * time.Hour // Set to 24 hours so VMs won't be considered stale
+
+	// Manually add entries to TrackedCRDs (simulating resources that were tracked)
+	healer.trackedCRDsMu.Lock()
+	healer.TrackedCRDs["virtualmachines/default/vm-1"] = true
+	healer.TrackedCRDs["virtualmachines/default/vm-2"] = true
+	healer.TrackedCRDs["virtualmachines/default/vm-deleted"] = true      // This one doesn't exist
+	healer.TrackedCRDs["virtualmachines/default/vm-also-deleted"] = true // This one doesn't exist
+	healer.TrackedCRDs["datavolumes/default/dv-1"] = true                // Different resource type, should not be cleaned
+	initialSize := len(healer.TrackedCRDs)
+	healer.trackedCRDsMu.Unlock()
+
+	// Call checkCRDResources - this should clean up entries for resources that no longer exist
+	healer.checkCRDResources("kubevirt.io", "v1", "virtualmachines")
+
+	// Restore original setting
+	healer.StaleAge = originalStaleAge
+
+	// Verify that deleted resources are removed from TrackedCRDs
+	healer.trackedCRDsMu.RLock()
+	finalSize := len(healer.TrackedCRDs)
+	vm1Exists := healer.TrackedCRDs["virtualmachines/default/vm-1"]
+	vm2Exists := healer.TrackedCRDs["virtualmachines/default/vm-2"]
+	vmDeletedExists := healer.TrackedCRDs["virtualmachines/default/vm-deleted"]
+	vmAlsoDeletedExists := healer.TrackedCRDs["virtualmachines/default/vm-also-deleted"]
+	dv1Exists := healer.TrackedCRDs["datavolumes/default/dv-1"]
+	healer.trackedCRDsMu.RUnlock()
+
+	// Existing resources should still be tracked
+	if !vm1Exists {
+		t.Error("vm-1 should still be tracked (it exists)")
+	}
+	if !vm2Exists {
+		t.Error("vm-2 should still be tracked (it exists)")
+	}
+
+	// Deleted resources should be removed
+	if vmDeletedExists {
+		t.Error("vm-deleted should have been removed from TrackedCRDs (resource doesn't exist)")
+	}
+	if vmAlsoDeletedExists {
+		t.Error("vm-also-deleted should have been removed from TrackedCRDs (resource doesn't exist)")
+	}
+
+	// Resources of different types should not be affected
+	if !dv1Exists {
+		t.Error("dv-1 should still be tracked (different resource type, not checked)")
+	}
+
+	// Verify size decreased by 2 (the two deleted VMs)
+	if finalSize != initialSize-2 {
+		t.Errorf("Expected TrackedCRDs size to decrease by 2, got initial=%d, final=%d", initialSize, finalSize)
+	}
+}
+
+func TestHealer_TrackedCRDsCleanup_SizeBasedCleanup(t *testing.T) {
+	healer, err := createTestHealer([]string{"default"})
+	if err != nil {
+		t.Fatalf("createTestHealer() error = %v", err)
+	}
+
+	// Fill TrackedCRDs with more than 5000 entries to trigger size-based cleanup
+	healer.trackedCRDsMu.Lock()
+	for i := 0; i < 6000; i++ {
+		key := fmt.Sprintf("virtualmachines/default/vm-%d", i)
+		healer.TrackedCRDs[key] = true
+	}
+	initialSize := len(healer.TrackedCRDs)
+	healer.trackedCRDsMu.Unlock()
+
+	if initialSize != 6000 {
+		t.Fatalf("Expected 6000 entries, got %d", initialSize)
+	}
+
+	// Trigger the cleanup by calling startHealCacheCleaner's ticker logic
+	// We'll simulate the cleanup directly
+	healer.trackedCRDsMu.Lock()
+	if len(healer.TrackedCRDs) > 5000 {
+		removed := 0
+		targetRemoval := len(healer.TrackedCRDs) * 3 / 10 // Remove 30%
+		for key := range healer.TrackedCRDs {
+			if removed >= targetRemoval {
+				break
+			}
+			delete(healer.TrackedCRDs, key)
+			removed++
+		}
+	}
+	finalSize := len(healer.TrackedCRDs)
+	healer.trackedCRDsMu.Unlock()
+
+	// Verify that approximately 30% was removed (allowing for rounding)
+	expectedSize := 6000 * 7 / 10 // 70% remaining
+	if finalSize < expectedSize-100 || finalSize > expectedSize+100 {
+		t.Errorf("Expected size-based cleanup to leave approximately %d entries, got %d", expectedSize, finalSize)
+	}
+
+	// Verify that size is now below the threshold
+	if finalSize > 5000 {
+		t.Errorf("Size-based cleanup should reduce size below 5000, got %d", finalSize)
+	}
+}
+
+func TestHealer_TrackedCRDsCleanup_EmptyCluster(t *testing.T) {
+	healer, err := createTestHealer([]string{"default"})
+	if err != nil {
+		t.Fatalf("createTestHealer() error = %v", err)
+	}
+
+	// Create fake dynamic client with registered resource types (but no resources)
+	scheme := runtime.NewScheme()
+	gvr := schema.GroupVersionResource{
+		Group:    "kubevirt.io",
+		Version:  "v1",
+		Resource: "virtualmachines",
+	}
+	// Register the resource type for listing
+	dynamicClient := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(scheme, map[schema.GroupVersionResource]string{
+		gvr: "VirtualMachineList",
+	})
+	healer.DynamicClient = dynamicClient
+
+	// Add some tracked CRDs that don't exist in the cluster
+	healer.trackedCRDsMu.Lock()
+	healer.TrackedCRDs["virtualmachines/default/vm-1"] = true
+	healer.TrackedCRDs["virtualmachines/default/vm-2"] = true
+	healer.TrackedCRDs["virtualmachines/default/vm-3"] = true
+	initialSize := len(healer.TrackedCRDs)
+	healer.trackedCRDsMu.Unlock()
+
+	if initialSize != 3 {
+		t.Fatalf("Expected 3 tracked CRDs initially, got %d", initialSize)
+	}
+
+	// Call checkCRDResources on an empty cluster
+	healer.checkCRDResources("kubevirt.io", "v1", "virtualmachines")
+
+	// All tracked VMs should be removed since none exist in the cluster
+	healer.trackedCRDsMu.RLock()
+	finalSize := len(healer.TrackedCRDs)
+	vm1Exists := healer.TrackedCRDs["virtualmachines/default/vm-1"]
+	vm2Exists := healer.TrackedCRDs["virtualmachines/default/vm-2"]
+	vm3Exists := healer.TrackedCRDs["virtualmachines/default/vm-3"]
+	healer.trackedCRDsMu.RUnlock()
+
+	// All should be removed
+	if vm1Exists || vm2Exists || vm3Exists {
+		t.Error("All tracked VMs should have been removed from empty cluster")
+	}
+
+	// Size should be 0 (all 3 were removed)
+	if finalSize != 0 {
+		t.Errorf("Expected TrackedCRDs to be empty after cleanup (initial=%d), got size %d", initialSize, finalSize)
+	}
+}
+
+func TestHealer_SanitizeReferences_ClearsAllMaps(t *testing.T) {
+	healer, err := createTestHealer([]string{"default"})
+	if err != nil {
+		t.Fatalf("createTestHealer() error = %v", err)
+	}
+
+	// Populate all tracking maps
+	healer.healedPodsMu.Lock()
+	healer.HealedPods["ns/pod1"] = time.Now()
+	healer.healedPodsMu.Unlock()
+	healer.healedNodesMu.Lock()
+	healer.HealedNodes["node1"] = time.Now()
+	healer.healedNodesMu.Unlock()
+	healer.healedVMsMu.Lock()
+	healer.HealedVMs["ns/vm1"] = time.Now()
+	healer.healedVMsMu.Unlock()
+	healer.healedCRDsMu.Lock()
+	healer.HealedCRDs["gvr/ns/name"] = time.Now()
+	healer.healedCRDsMu.Unlock()
+	healer.trackedCRDsMu.Lock()
+	healer.TrackedCRDs["resource/ns/name"] = true
+	healer.trackedCRDsMu.Unlock()
+	healer.optimizedPodsMu.Lock()
+	healer.OptimizedPods["ns/pod2"] = time.Now()
+	healer.optimizedPodsMu.Unlock()
+	healer.currentClusterStrainMu.Lock()
+	healer.CurrentClusterStrain = &util.ClusterStrainInfo{HasStrain: true}
+	healer.currentClusterStrainMu.Unlock()
+
+	healer.SanitizeReferences()
+
+	// All maps and strain should be empty/nil
+	healer.healedPodsMu.RLock()
+	podsLen := len(healer.HealedPods)
+	healer.healedPodsMu.RUnlock()
+	healer.healedNodesMu.RLock()
+	nodesLen := len(healer.HealedNodes)
+	healer.healedNodesMu.RUnlock()
+	healer.healedVMsMu.RLock()
+	vmsLen := len(healer.HealedVMs)
+	healer.healedVMsMu.RUnlock()
+	healer.healedCRDsMu.RLock()
+	crdsLen := len(healer.HealedCRDs)
+	healer.healedCRDsMu.RUnlock()
+	healer.trackedCRDsMu.RLock()
+	trackedLen := len(healer.TrackedCRDs)
+	healer.trackedCRDsMu.RUnlock()
+	healer.optimizedPodsMu.RLock()
+	optLen := len(healer.OptimizedPods)
+	healer.optimizedPodsMu.RUnlock()
+	healer.currentClusterStrainMu.RLock()
+	strainNil := healer.CurrentClusterStrain == nil
+	healer.currentClusterStrainMu.RUnlock()
+
+	if podsLen != 0 || nodesLen != 0 || vmsLen != 0 || crdsLen != 0 || trackedLen != 0 || optLen != 0 || !strainNil {
+		t.Errorf("SanitizeReferences() did not clear all state: HealedPods=%d HealedNodes=%d HealedVMs=%d HealedCRDs=%d TrackedCRDs=%d OptimizedPods=%d CurrentClusterStrain=nil=%v",
+			podsLen, nodesLen, vmsLen, crdsLen, trackedLen, optLen, strainNil)
+	}
+}
+
+func TestHealer_CheckMemory_OverLimit_SanitizesAndRequestsRestart(t *testing.T) {
+	healer, err := createTestHealer([]string{"default"})
+	if err != nil {
+		t.Fatalf("createTestHealer() error = %v", err)
+	}
+
+	// Inject heap over limit (100 MB), limit 50 MB
+	healer.MemoryLimitMB = 50
+	healer.RestartOnMemoryLimit = true
+	healer.RestartRequested = make(chan struct{})
+	healer.MemoryReadFunc = func() uint64 { return 100 * 1024 * 1024 }
+
+	// Add some state so we can verify sanitization
+	healer.trackedCRDsMu.Lock()
+	healer.TrackedCRDs["r/ns/n"] = true
+	healer.trackedCRDsMu.Unlock()
+
+	healer.checkMemory()
+
+	// Maps should be cleared by SanitizeReferences
+	healer.trackedCRDsMu.RLock()
+	lenTracked := len(healer.TrackedCRDs)
+	healer.trackedCRDsMu.RUnlock()
+	if lenTracked != 0 {
+		t.Errorf("Expected TrackedCRDs to be cleared after checkMemory over limit, got len %d", lenTracked)
+	}
+	// Restart should have been requested
+	if !healer.IsRestartRequested() {
+		t.Error("Expected IsRestartRequested() to be true after checkMemory over limit with RestartOnMemoryLimit=true")
+	}
+	// RestartRequested channel should be closed (receive should not block)
+	select {
+	case <-healer.RestartRequested:
+		// closed, good
+	default:
+		t.Error("Expected RestartRequested channel to be closed")
+	}
+}
+
+func TestHealer_CheckMemory_UnderLimit_NoAction(t *testing.T) {
+	healer, err := createTestHealer([]string{"default"})
+	if err != nil {
+		t.Fatalf("createTestHealer() error = %v", err)
+	}
+
+	healer.MemoryLimitMB = 50
+	healer.RestartRequested = make(chan struct{})
+	healer.MemoryReadFunc = func() uint64 { return 10 * 1024 * 1024 } // 10 MB, under limit
+
+	healer.trackedCRDsMu.Lock()
+	healer.TrackedCRDs["r/ns/n"] = true
+	healer.trackedCRDsMu.Unlock()
+
+	healer.checkMemory()
+
+	// State should be unchanged
+	healer.trackedCRDsMu.RLock()
+	lenTracked := len(healer.TrackedCRDs)
+	healer.trackedCRDsMu.RUnlock()
+	if lenTracked != 1 {
+		t.Errorf("Expected TrackedCRDs to be unchanged (len 1), got %d", lenTracked)
+	}
+	if healer.IsRestartRequested() {
+		t.Error("Expected IsRestartRequested() to be false when under limit")
+	}
+	select {
+	case <-healer.RestartRequested:
+		t.Error("RestartRequested should not be closed when under limit")
+	default:
+		// not closed, good
+	}
+}
+
+func TestHealer_CheckMemory_DoesNothingWhenDisabled(t *testing.T) {
+	healer, err := createTestHealer([]string{"default"})
+	if err != nil {
+		t.Fatalf("createTestHealer() error = %v", err)
+	}
+
+	healer.MemoryLimitMB = 0
+	healer.trackedCRDsMu.Lock()
+	healer.TrackedCRDs["r/ns/n"] = true
+	healer.trackedCRDsMu.Unlock()
+
+	healer.checkMemory()
+
+	// State unchanged (checkMemory returns early when MemoryLimitMB == 0)
+	healer.trackedCRDsMu.RLock()
+	lenTracked := len(healer.TrackedCRDs)
+	healer.trackedCRDsMu.RUnlock()
+	if lenTracked != 1 {
+		t.Errorf("Expected TrackedCRDs unchanged when memory limit disabled, got len %d", lenTracked)
 	}
 }

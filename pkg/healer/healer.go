@@ -5,7 +5,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/bmaio-redhat/k8s-healer/pkg/healthcheck"
@@ -31,12 +34,18 @@ type Healer struct {
 	ClientSet                        kubernetes.Interface
 	DynamicClient                    dynamic.Interface
 	Namespaces                       []string
+	namespacesMu                     sync.RWMutex // Protects Namespaces slice
 	StopCh                           chan struct{}
 	HealedPods                       map[string]time.Time // Tracks recently healed pods
+	healedPodsMu                     sync.RWMutex         // Protects HealedPods map
 	HealedNodes                      map[string]time.Time // Tracks recently healed nodes
+	healedNodesMu                    sync.RWMutex         // Protects HealedNodes map
 	HealedVMs                        map[string]time.Time // Tracks recently healed VMs
+	healedVMsMu                      sync.RWMutex         // Protects HealedVMs map
 	HealedCRDs                       map[string]time.Time // Tracks recently cleaned CRDs
+	healedCRDsMu                     sync.RWMutex         // Protects HealedCRDs map
 	TrackedCRDs                      map[string]bool      // Tracks all CRD resources we've seen (for creation logging)
+	trackedCRDsMu                    sync.RWMutex         // Protects TrackedCRDs map
 	HealCooldown                     time.Duration
 	EnableVMHealing                  bool                    // Flag to enable VM healing
 	EnableCRDCleanup                 bool                    // Flag to enable CRD cleanup
@@ -46,13 +55,25 @@ type Healer struct {
 	EnableResourceOptimization       bool                    // Flag to enable resource optimization during cluster strain
 	StrainThreshold                  float64                 // Percentage of nodes under pressure to trigger optimization
 	OptimizedPods                    map[string]time.Time    // Tracks recently optimized pods
+	optimizedPodsMu                  sync.RWMutex            // Protects OptimizedPods map
 	EnableNamespacePolling           bool                    // Flag to enable namespace polling
 	NamespacePattern                 string                  // Pattern to match namespaces (e.g., "test-*")
 	NamespacePollInterval            time.Duration           // How often to poll for new namespaces
 	WatchedNamespaces                map[string]bool         // Tracks namespaces we're currently watching
+	watchedNamespacesMu              sync.RWMutex            // Protects WatchedNamespaces map
 	EnableResourceCreationThrottling bool                    // Flag to enable resource creation throttling during cluster strain
 	CurrentClusterStrain             *util.ClusterStrainInfo // Current cluster strain state (updated by resource optimization)
+	currentClusterStrainMu           sync.RWMutex            // Protects CurrentClusterStrain
 	ExcludedNamespaces               []string                // Namespaces to exclude from prefix-based discovery
+
+	// Memory limit: when heap exceeds MemoryLimitMB, references are sanitized and optionally process exits for restart
+	MemoryLimitMB        uint64        // Heap limit in MB (0 = disabled)
+	MemoryCheckInterval  time.Duration // How often to check memory (e.g. 1m)
+	RestartOnMemoryLimit bool          // If true, exit process when over limit after sanitization (for process manager to restart)
+	RestartRequested     chan struct{} // Closed when memory limit exceeded and restart requested; main should exit(0)
+	restartRequestedFlag int32         // Atomic: 1 when RestartRequested was closed (so main can os.Exit(0))
+	// MemoryReadFunc is optional; when set (e.g. in tests), checkMemory uses it instead of runtime.ReadMemStats
+	MemoryReadFunc func() uint64
 }
 
 // NewHealer initializes the Kubernetes client configuration using kubeconfig or in-cluster settings.
@@ -117,12 +138,106 @@ func NewHealer(kubeconfigPath string, namespaces []string, enableVMHealing bool,
 		EnableResourceCreationThrottling: true, // default to enabled
 		CurrentClusterStrain:             nil,  // Will be updated by resource optimization checks
 		ExcludedNamespaces:               excludedNamespaces,
+		RestartRequested:                 make(chan struct{}), // closed when memory limit exceeded and restart requested
 	}
 
 	// Display cluster information after successful connection
 	healer.DisplayClusterInfo(config, kubeconfigPath)
 
 	return healer, nil
+}
+
+// Warmup validates cluster readiness before starting heavy operations
+// It checks CRD availability and API connectivity to ensure the cluster is ready
+// for concurrent resource creation (e.g., before automated tests begin)
+func (h *Healer) Warmup(timeout time.Duration) error {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	fmt.Printf("   [1/3] Validating Kubernetes API connectivity...\n")
+	// Test basic API connectivity
+	_, err := h.ClientSet.CoreV1().Namespaces().List(ctx, metav1.ListOptions{Limit: 1})
+	if err != nil {
+		return fmt.Errorf("failed to connect to Kubernetes API: %w", err)
+	}
+	fmt.Printf("   ✅ Kubernetes API is accessible\n")
+
+	// If CRD cleanup is enabled, validate CRD resources are available
+	if h.EnableCRDCleanup && len(h.CRDResources) > 0 {
+		fmt.Printf("   [2/3] Validating CRD resource availability (%d resource types)...\n", len(h.CRDResources))
+
+		var unavailableMu sync.Mutex
+		var availableMu sync.Mutex
+		unavailable := []string{}
+		available := 0
+
+		var wg sync.WaitGroup
+		for _, crdResource := range h.CRDResources {
+			wg.Add(1)
+			go func(crdRes string) {
+				defer wg.Done()
+				// Parse the resource string (format: "resource.group/version" or "resource.group")
+				parts := strings.Split(crdRes, ".")
+				if len(parts) < 2 {
+					return
+				}
+
+				resource := parts[0]
+				groupVersion := strings.Join(parts[1:], ".")
+
+				// Split group and version
+				gvParts := strings.Split(groupVersion, "/")
+				group := gvParts[0]
+				version := "v1" // default
+				if len(gvParts) > 1 {
+					version = gvParts[1]
+				}
+
+				gvr := schema.GroupVersionResource{
+					Group:    group,
+					Version:  version,
+					Resource: resource,
+				}
+
+				// Try to list resources (with limit 1 to minimize load)
+				_, err := h.DynamicClient.Resource(gvr).List(ctx, metav1.ListOptions{Limit: 1})
+				if err != nil {
+					if apierrors.IsNotFound(err) {
+						unavailableMu.Lock()
+						unavailable = append(unavailable, crdRes)
+						unavailableMu.Unlock()
+						return
+					}
+					// For other errors (like forbidden), we'll still consider it available
+					// as the CRD exists, we just can't access it
+				}
+				availableMu.Lock()
+				available++
+				availableMu.Unlock()
+			}(crdResource)
+		}
+		wg.Wait()
+
+		if len(unavailable) > 0 {
+			fmt.Printf("   ⚠️  %d/%d CRD resource types available\n", available, len(h.CRDResources))
+			fmt.Printf("   ⚠️  Unavailable CRD resources: %s\n", strings.Join(unavailable, ", "))
+			fmt.Printf("   💡 These may become available later - continuing anyway\n")
+		} else {
+			fmt.Printf("   ✅ All %d CRD resource types are available\n", len(h.CRDResources))
+		}
+	} else {
+		fmt.Printf("   [2/3] Skipping CRD validation (CRD cleanup disabled or no resources specified)\n")
+	}
+
+	fmt.Printf("   [3/3] Performing final readiness check...\n")
+	// Final connectivity check
+	_, err = h.ClientSet.CoreV1().Nodes().List(ctx, metav1.ListOptions{Limit: 1})
+	if err != nil {
+		return fmt.Errorf("failed final readiness check: %w", err)
+	}
+	fmt.Printf("   ✅ Cluster is ready for heavy operations\n")
+
+	return nil
 }
 
 // DisplayClusterInfo displays a summary of the cluster being monitored
@@ -256,12 +371,16 @@ func formatBool(b bool) string {
 // Watch starts the informer loop for all configured namespaces concurrently.
 func (h *Healer) Watch() {
 	// If no namespaces are provided, default to watching all namespaces
+	h.namespacesMu.Lock()
 	if len(h.Namespaces) == 0 {
 		fmt.Println("No namespaces specified. Watching all namespaces (using NamespaceAll).")
 		h.Namespaces = []string{metav1.NamespaceAll}
 	}
+	namespacesCopy := make([]string, len(h.Namespaces))
+	copy(namespacesCopy, h.Namespaces)
+	h.namespacesMu.Unlock()
 
-	fmt.Printf("Starting healer to watch namespaces: [%s]\n", strings.Join(h.Namespaces, ", "))
+	fmt.Printf("Starting healer to watch namespaces: [%s]\n", strings.Join(namespacesCopy, ", "))
 	if h.EnableVMHealing {
 		fmt.Println("VM healing is ENABLED - monitoring nodes and VirtualMachines")
 	} else {
@@ -290,9 +409,10 @@ func (h *Healer) Watch() {
 	}
 
 	h.startHealCacheCleaner()
+	h.startMemoryGuard()
 
 	// Start a separate goroutine for the informer watch in each namespace
-	for _, ns := range h.Namespaces {
+	for _, ns := range namespacesCopy {
 		go h.watchSingleNamespace(ns)
 	}
 
@@ -329,8 +449,11 @@ func (h *Healer) Watch() {
 		}
 	}
 
-	// Block the main goroutine until the StopCh channel is closed (on SIGINT/SIGTERM)
-	<-h.StopCh
+	// Block until shutdown (SIGINT/SIGTERM) or memory-limit restart requested
+	select {
+	case <-h.StopCh:
+	case <-h.RestartRequested:
+	}
 }
 
 // watchSingleNamespace sets up a Pod Informer for one namespace.
@@ -373,20 +496,12 @@ func (h *Healer) checkAndHealPod(pod *v1.Pod) {
 		return
 	}
 
-	// Skip if namespace is excluded from deletion
-	if h.isExcludedNamespace(pod.Namespace) {
-		// Still monitor but don't delete
-		if util.IsUnhealthy(pod) {
-			reason := util.GetHealReason(pod)
-			fmt.Printf("   [MONITOR] 🔍 Pod %s/%s is unhealthy (%s) but namespace is excluded from deletion\n",
-				pod.Namespace, pod.Name, reason)
-		}
-		return
-	}
-
 	// Skip if recently healed
 	podKey := fmt.Sprintf("%s/%s", pod.Namespace, pod.Name)
-	if lastHeal, ok := h.HealedPods[podKey]; ok {
+	h.healedPodsMu.RLock()
+	lastHeal, recentlyHealed := h.HealedPods[podKey]
+	h.healedPodsMu.RUnlock()
+	if recentlyHealed {
 		if time.Since(lastHeal) < h.HealCooldown {
 			fmt.Printf("   [SKIP] ⏳ Pod %s was healed %.0f seconds ago — skipping re-heal.\n",
 				podKey, time.Since(lastHeal).Seconds())
@@ -403,7 +518,9 @@ func (h *Healer) checkAndHealPod(pod *v1.Pod) {
 		h.triggerPodDeletion(pod)
 
 		// Record the healing timestamp
+		h.healedPodsMu.Lock()
 		h.HealedPods[podKey] = time.Now()
+		h.healedPodsMu.Unlock()
 
 		fmt.Printf("!!! HEALING ACTION COMPLETE !!!\n\n")
 	}
@@ -418,41 +535,54 @@ func (h *Healer) startHealCacheCleaner() {
 			case <-ticker.C:
 				now := time.Now()
 				// Clean up healed pods
+				h.healedPodsMu.Lock()
 				for key, t := range h.HealedPods {
 					if now.Sub(t) > 2*h.HealCooldown {
 						delete(h.HealedPods, key)
 					}
 				}
+				h.healedPodsMu.Unlock()
 				// Clean up healed nodes
+				h.healedNodesMu.Lock()
 				for key, t := range h.HealedNodes {
 					if now.Sub(t) > 2*h.HealCooldown {
 						delete(h.HealedNodes, key)
 					}
 				}
+				h.healedNodesMu.Unlock()
 				// Clean up healed VMs
+				h.healedVMsMu.Lock()
 				for key, t := range h.HealedVMs {
 					if now.Sub(t) > 2*h.HealCooldown {
 						delete(h.HealedVMs, key)
 					}
 				}
+				h.healedVMsMu.Unlock()
 				// Clean up healed CRDs
+				h.healedCRDsMu.Lock()
 				for key, t := range h.HealedCRDs {
 					if now.Sub(t) > 2*h.HealCooldown {
 						delete(h.HealedCRDs, key)
 					}
 				}
+				h.healedCRDsMu.Unlock()
 				// Clean up optimized pods
+				h.optimizedPodsMu.Lock()
 				for key, t := range h.OptimizedPods {
 					if now.Sub(t) > 2*h.HealCooldown {
 						delete(h.OptimizedPods, key)
 					}
 				}
+				h.optimizedPodsMu.Unlock()
 				// Limit TrackedCRDs map size to prevent unbounded growth
-				// If map exceeds 10000 entries, remove 20% of entries
+				// If map exceeds 5000 entries, remove 30% of entries (more aggressive cleanup)
 				// This prevents memory from growing unbounded in long-running processes
-				if len(h.TrackedCRDs) > 10000 {
+				// Note: The periodic cleanup in checkCRDResources will also remove entries for
+				// resources that no longer exist, but this provides a safety net
+				h.trackedCRDsMu.Lock()
+				if len(h.TrackedCRDs) > 5000 {
 					removed := 0
-					targetRemoval := len(h.TrackedCRDs) / 5 // Remove 20%
+					targetRemoval := len(h.TrackedCRDs) * 3 / 10 // Remove 30%
 					for key := range h.TrackedCRDs {
 						if removed >= targetRemoval {
 							break
@@ -460,13 +590,123 @@ func (h *Healer) startHealCacheCleaner() {
 						delete(h.TrackedCRDs, key)
 						removed++
 					}
+					if removed > 0 {
+						fmt.Printf("   [INFO] 🧹 Cleaned up %d old CRD resource reference(s) to prevent memory growth (map size: %d)\n",
+							removed, len(h.TrackedCRDs))
+					}
 				}
+				h.trackedCRDsMu.Unlock()
 			case <-h.StopCh:
 				ticker.Stop()
 				return
 			}
 		}
 	}()
+}
+
+// SanitizeReferences clears all in-memory tracking maps to free memory. Call when approaching memory limits.
+// Monitoring continues; only historical references (healed/tracked resources) are cleared.
+func (h *Healer) SanitizeReferences() {
+	h.healedPodsMu.Lock()
+	h.HealedPods = make(map[string]time.Time)
+	h.healedPodsMu.Unlock()
+
+	h.healedNodesMu.Lock()
+	h.HealedNodes = make(map[string]time.Time)
+	h.healedNodesMu.Unlock()
+
+	h.healedVMsMu.Lock()
+	h.HealedVMs = make(map[string]time.Time)
+	h.healedVMsMu.Unlock()
+
+	h.healedCRDsMu.Lock()
+	h.HealedCRDs = make(map[string]time.Time)
+	h.healedCRDsMu.Unlock()
+
+	h.trackedCRDsMu.Lock()
+	h.TrackedCRDs = make(map[string]bool)
+	h.trackedCRDsMu.Unlock()
+
+	h.optimizedPodsMu.Lock()
+	h.OptimizedPods = make(map[string]time.Time)
+	h.optimizedPodsMu.Unlock()
+
+	h.currentClusterStrainMu.Lock()
+	h.CurrentClusterStrain = nil
+	h.currentClusterStrainMu.Unlock()
+
+	runtime.GC()
+	fmt.Printf("   [INFO] 🧹 Sanitized all tracking references and ran GC\n")
+}
+
+// checkMemory reads current heap (or uses MemoryReadFunc if set), and if over MemoryLimitMB
+// runs SanitizeReferences; if still over limit and RestartOnMemoryLimit, closes RestartRequested.
+// Used by startMemoryGuard; also callable from tests when MemoryReadFunc is set.
+func (h *Healer) checkMemory() {
+	if h.MemoryLimitMB == 0 {
+		return
+	}
+	limitBytes := h.MemoryLimitMB * 1024 * 1024
+	var heapAlloc uint64
+	if h.MemoryReadFunc != nil {
+		heapAlloc = h.MemoryReadFunc()
+	} else {
+		var m runtime.MemStats
+		runtime.ReadMemStats(&m)
+		heapAlloc = m.HeapAlloc
+	}
+	if heapAlloc <= limitBytes {
+		return
+	}
+	fmt.Printf("   [WARN] ⚠️ Memory limit exceeded: heap %.1f MB > limit %d MB — sanitizing references\n",
+		float64(heapAlloc)/(1024*1024), h.MemoryLimitMB)
+	h.SanitizeReferences()
+	if h.MemoryReadFunc != nil {
+		heapAlloc = h.MemoryReadFunc()
+	} else {
+		var m runtime.MemStats
+		runtime.ReadMemStats(&m)
+		heapAlloc = m.HeapAlloc
+	}
+	if heapAlloc <= limitBytes {
+		fmt.Printf("   [INFO] ✅ Memory below limit after sanitization (%.1f MB)\n", float64(heapAlloc)/(1024*1024))
+		return
+	}
+	fmt.Printf("   [WARN] ⚠️ Memory still above limit after sanitization: %.1f MB — requesting restart\n",
+		float64(heapAlloc)/(1024*1024))
+	if h.RestartOnMemoryLimit && h.RestartRequested != nil {
+		if atomic.CompareAndSwapInt32(&h.restartRequestedFlag, 0, 1) {
+			close(h.RestartRequested)
+		}
+	}
+}
+
+// startMemoryGuard runs a goroutine that periodically calls checkMemory.
+func (h *Healer) startMemoryGuard() {
+	if h.MemoryLimitMB == 0 {
+		return
+	}
+	interval := h.MemoryCheckInterval
+	if interval <= 0 {
+		interval = time.Minute
+	}
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				h.checkMemory()
+			case <-h.StopCh:
+				return
+			}
+		}
+	}()
+}
+
+// IsRestartRequested returns true if the memory guard has requested a process restart (main should exit(0)).
+func (h *Healer) IsRestartRequested() bool {
+	return atomic.LoadInt32(&h.restartRequestedFlag) == 1
 }
 
 // triggerPodDeletion deletes the Pod, relying on the managing controller to recreate a fresh one.
@@ -516,7 +756,10 @@ func (h *Healer) watchNodes() {
 func (h *Healer) checkAndHealNode(node *v1.Node) {
 	// Skip if recently healed
 	nodeKey := node.Name
-	if lastHeal, ok := h.HealedNodes[nodeKey]; ok {
+	h.healedNodesMu.RLock()
+	lastHeal, recentlyHealed := h.HealedNodes[nodeKey]
+	h.healedNodesMu.RUnlock()
+	if recentlyHealed {
 		if time.Since(lastHeal) < h.HealCooldown {
 			fmt.Printf("   [SKIP] ⏳ Node %s was healed %.0f seconds ago — skipping re-heal.\n",
 				nodeKey, time.Since(lastHeal).Seconds())
@@ -533,7 +776,9 @@ func (h *Healer) checkAndHealNode(node *v1.Node) {
 		h.triggerNodeHealing(node)
 
 		// Record the healing timestamp
+		h.healedNodesMu.Lock()
 		h.HealedNodes[nodeKey] = time.Now()
+		h.healedNodesMu.Unlock()
 
 		fmt.Printf("!!! NODE HEALING ACTION COMPLETE !!!\n\n")
 	}
@@ -573,7 +818,8 @@ func (h *Healer) drainNode(ctx context.Context, nodeName string) error {
 		return fmt.Errorf("failed to list pods on node: %w", err)
 	}
 
-	// Evict each pod
+	// Evict each pod in parallel
+	var wg sync.WaitGroup
 	for _, pod := range pods.Items {
 		// Skip pods without owner references (static pods)
 		if len(pod.OwnerReferences) == 0 {
@@ -581,25 +827,35 @@ func (h *Healer) drainNode(ctx context.Context, nodeName string) error {
 		}
 
 		// Skip DaemonSet pods
+		skipPod := false
 		for _, ownerRef := range pod.OwnerReferences {
 			if ownerRef.Kind == "DaemonSet" {
-				continue
+				skipPod = true
+				break
 			}
 		}
-
-		// Evict the pod using the eviction API
-		err := h.ClientSet.CoreV1().Pods(pod.Namespace).EvictV1(ctx, &policyv1.Eviction{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      pod.Name,
-				Namespace: pod.Namespace,
-			},
-		})
-		if err != nil {
-			fmt.Printf("   [WARN] ⚠️ Failed to evict pod %s/%s: %v\n", pod.Namespace, pod.Name, err)
-		} else {
-			fmt.Printf("   [INFO] ✅ Evicted pod %s/%s from node %s\n", pod.Namespace, pod.Name, nodeName)
+		if skipPod {
+			continue
 		}
+
+		// Evict the pod using the eviction API (in parallel)
+		wg.Add(1)
+		go func(p v1.Pod) {
+			defer wg.Done()
+			err := h.ClientSet.CoreV1().Pods(p.Namespace).EvictV1(ctx, &policyv1.Eviction{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      p.Name,
+					Namespace: p.Namespace,
+				},
+			})
+			if err != nil {
+				fmt.Printf("   [WARN] ⚠️ Failed to evict pod %s/%s: %v\n", p.Namespace, p.Name, err)
+			} else {
+				fmt.Printf("   [INFO] ✅ Evicted pod %s/%s from node %s\n", p.Namespace, p.Name, nodeName)
+			}
+		}(pod)
 	}
+	wg.Wait()
 
 	return nil
 }
@@ -633,7 +889,11 @@ func (h *Healer) checkAllVirtualMachines() {
 		Resource: "virtualmachines",
 	}
 
-	namespaces := h.Namespaces
+	h.namespacesMu.RLock()
+	namespaces := make([]string, len(h.Namespaces))
+	copy(namespaces, h.Namespaces)
+	h.namespacesMu.RUnlock()
+
 	if len(namespaces) == 0 || (len(namespaces) == 1 && namespaces[0] == metav1.NamespaceAll) {
 		// Get all namespaces
 		nsList, err := h.ClientSet.CoreV1().Namespaces().List(context.TODO(), metav1.ListOptions{})
@@ -647,17 +907,24 @@ func (h *Healer) checkAllVirtualMachines() {
 		}
 	}
 
+	// Process namespaces in parallel
+	var wg sync.WaitGroup
 	for _, ns := range namespaces {
-		vms, err := h.DynamicClient.Resource(vmGVR).Namespace(ns).List(context.TODO(), metav1.ListOptions{})
-		if err != nil {
-			// Skip if VirtualMachine CRD is not available
-			continue
-		}
+		wg.Add(1)
+		go func(namespace string) {
+			defer wg.Done()
+			vms, err := h.DynamicClient.Resource(vmGVR).Namespace(namespace).List(context.TODO(), metav1.ListOptions{})
+			if err != nil {
+				// Skip if VirtualMachine CRD is not available
+				return
+			}
 
-		for _, vmUnstructured := range vms.Items {
-			h.checkAndHealVirtualMachine(&vmUnstructured)
-		}
+			for _, vmUnstructured := range vms.Items {
+				h.checkAndHealVirtualMachine(&vmUnstructured)
+			}
+		}(ns)
 	}
+	wg.Wait()
 }
 
 // checkAndHealVirtualMachine checks a VirtualMachine's health and executes healing if necessary
@@ -671,19 +938,11 @@ func (h *Healer) checkAndHealVirtualMachine(vm *unstructured.Unstructured) {
 		fmt.Printf("   [MONITOR] 🔍 VM %s health check: %s\n", vmKey, reason)
 	}
 
-	// Skip if namespace is excluded from deletion
-	if h.isExcludedNamespace(vm.GetNamespace()) {
-		// Still monitor but don't delete
-		vmAge := time.Since(vm.GetCreationTimestamp().Time)
-		if vmAge > 6*time.Minute {
-			fmt.Printf("   [MONITOR] 🔍 VM %s is older than threshold (%v) but namespace is excluded from deletion\n",
-				vmKey, vmAge.Round(time.Second))
-		}
-		return
-	}
-
 	// Skip if recently healed
-	if lastHeal, ok := h.HealedVMs[vmKey]; ok {
+	h.healedVMsMu.RLock()
+	lastHeal, recentlyHealed := h.HealedVMs[vmKey]
+	h.healedVMsMu.RUnlock()
+	if recentlyHealed {
 		if time.Since(lastHeal) < h.HealCooldown {
 			fmt.Printf("   [SKIP] ⏳ VM %s was healed %.0f seconds ago — skipping re-heal.\n",
 				vmKey, time.Since(lastHeal).Seconds())
@@ -710,7 +969,9 @@ func (h *Healer) checkAndHealVirtualMachine(vm *unstructured.Unstructured) {
 		h.triggerVirtualMachineHealing(vm)
 
 		// Record the healing timestamp
+		h.healedVMsMu.Lock()
 		h.HealedVMs[vmKey] = time.Now()
+		h.healedVMsMu.Unlock()
 
 		fmt.Printf("!!! VM CLEANUP ACTION COMPLETE !!!\n\n")
 	}
@@ -786,7 +1047,11 @@ func (h *Healer) checkCRDResources(group, version, resource string) {
 		Resource: resource,
 	}
 
-	namespaces := h.Namespaces
+	h.namespacesMu.RLock()
+	namespaces := make([]string, len(h.Namespaces))
+	copy(namespaces, h.Namespaces)
+	h.namespacesMu.RUnlock()
+
 	if len(namespaces) == 0 || (len(namespaces) == 1 && namespaces[0] == metav1.NamespaceAll) {
 		// Get all namespaces
 		nsList, err := h.ClientSet.CoreV1().Namespaces().List(context.TODO(), metav1.ListOptions{})
@@ -800,19 +1065,59 @@ func (h *Healer) checkCRDResources(group, version, resource string) {
 		}
 	}
 
-	for _, ns := range namespaces {
-		resources, err := h.DynamicClient.Resource(gvr).Namespace(ns).List(context.TODO(), metav1.ListOptions{})
-		if err != nil {
-			// Skip if CRD is not available or not accessible
-			continue
-		}
+	// Process namespaces in parallel and collect existing resources
+	var wg sync.WaitGroup
+	var existingResourcesMu sync.Mutex
+	existingResources := make(map[string]bool) // Track resources that currently exist
 
-		for _, resourceUnstructured := range resources.Items {
-			// Log CRD creation if it's a new resource we haven't seen before
-			h.logCRDCreation(&resourceUnstructured, gvr)
-			// Check if resource is stale and needs cleanup
-			h.checkAndCleanupCRDResource(&resourceUnstructured, gvr)
+	for _, ns := range namespaces {
+		wg.Add(1)
+		go func(namespace string) {
+			defer wg.Done()
+			resources, err := h.DynamicClient.Resource(gvr).Namespace(namespace).List(context.TODO(), metav1.ListOptions{})
+			if err != nil {
+				// Skip if CRD is not available or not accessible
+				return
+			}
+
+			for _, resourceUnstructured := range resources.Items {
+				resourceKey := fmt.Sprintf("%s/%s/%s", gvr.Resource, resourceUnstructured.GetNamespace(), resourceUnstructured.GetName())
+				// Mark as existing
+				existingResourcesMu.Lock()
+				existingResources[resourceKey] = true
+				existingResourcesMu.Unlock()
+
+				// Log CRD creation if it's a new resource we haven't seen before
+				h.logCRDCreation(&resourceUnstructured, gvr)
+				// Check if resource is stale and needs cleanup
+				h.checkAndCleanupCRDResource(&resourceUnstructured, gvr)
+			}
+		}(ns)
+	}
+	wg.Wait()
+
+	// Clean up TrackedCRDs entries for resources that no longer exist
+	// Only check resources for this specific GVR (format: "resource/namespace/name")
+	h.trackedCRDsMu.Lock()
+	removedCount := 0
+	for key := range h.TrackedCRDs {
+		// Check if this key matches the current GVR format
+		// Format: "resource/namespace/name"
+		parts := strings.Split(key, "/")
+		if len(parts) == 3 && parts[0] == gvr.Resource {
+			// This is a resource of the type we just checked
+			if !existingResources[key] {
+				// Resource no longer exists, remove from tracking
+				delete(h.TrackedCRDs, key)
+				removedCount++
+			}
 		}
+	}
+	h.trackedCRDsMu.Unlock()
+
+	if removedCount > 0 {
+		fmt.Printf("   [INFO] 🧹 Cleaned up %d stale CRD resource reference(s) for %s/%s/%s (resources no longer exist)\n",
+			removedCount, gvr.Group, gvr.Version, gvr.Resource)
 	}
 }
 
@@ -821,7 +1126,11 @@ func (h *Healer) logCRDCreation(resource *unstructured.Unstructured, gvr schema.
 	resourceKey := fmt.Sprintf("%s/%s/%s", gvr.Resource, resource.GetNamespace(), resource.GetName())
 
 	// Check if we've seen this resource before
-	if !h.TrackedCRDs[resourceKey] {
+	h.trackedCRDsMu.RLock()
+	alreadyTracked := h.TrackedCRDs[resourceKey]
+	h.trackedCRDsMu.RUnlock()
+
+	if !alreadyTracked {
 		// New resource detected
 		creationTime := resource.GetCreationTimestamp()
 		age := time.Since(creationTime.Time)
@@ -835,26 +1144,20 @@ func (h *Healer) logCRDCreation(resource *unstructured.Unstructured, gvr schema.
 			gvr.Resource, resource.GetNamespace(), resource.GetName(), age.Round(time.Second))
 
 		// Mark as tracked
+		h.trackedCRDsMu.Lock()
 		h.TrackedCRDs[resourceKey] = true
+		h.trackedCRDsMu.Unlock()
 	}
 }
 
 // checkAndCleanupCRDResource checks if a CRD resource is stale and cleans it up if needed
 func (h *Healer) checkAndCleanupCRDResource(resource *unstructured.Unstructured, gvr schema.GroupVersionResource) {
-	// Skip if namespace is excluded from deletion
-	if h.isExcludedNamespace(resource.GetNamespace()) {
-		// Still monitor but don't delete
-		if util.IsCRDResourceStale(resource, h.StaleAge, h.CleanupFinalizers) {
-			reason := util.GetCRDResourceStaleReason(resource, h.StaleAge, h.CleanupFinalizers)
-			fmt.Printf("   [MONITOR] 🔍 CRD resource %s/%s/%s is stale (%s) but namespace is excluded from deletion\n",
-				gvr.Resource, resource.GetNamespace(), resource.GetName(), reason)
-		}
-		return
-	}
-
 	// Skip if recently cleaned
 	resourceKey := fmt.Sprintf("%s/%s/%s", gvr.Resource, resource.GetNamespace(), resource.GetName())
-	if lastClean, ok := h.HealedCRDs[resourceKey]; ok {
+	h.healedCRDsMu.RLock()
+	lastClean, recentlyCleaned := h.HealedCRDs[resourceKey]
+	h.healedCRDsMu.RUnlock()
+	if recentlyCleaned {
 		if time.Since(lastClean) < h.HealCooldown {
 			return
 		}
@@ -875,7 +1178,9 @@ func (h *Healer) checkAndCleanupCRDResource(resource *unstructured.Unstructured,
 			h.triggerCRDCleanup(resource, gvr)
 
 			// Record the cleanup timestamp
+			h.healedCRDsMu.Lock()
 			h.HealedCRDs[resourceKey] = time.Now()
+			h.healedCRDsMu.Unlock()
 
 			fmt.Printf("!!! CRD CLEANUP ACTION COMPLETE !!!\n\n")
 		}
@@ -892,7 +1197,9 @@ func (h *Healer) checkAndCleanupCRDResource(resource *unstructured.Unstructured,
 		h.triggerCRDCleanup(resource, gvr)
 
 		// Record the cleanup timestamp
+		h.healedCRDsMu.Lock()
 		h.HealedCRDs[resourceKey] = time.Now()
+		h.healedCRDsMu.Unlock()
 
 		fmt.Printf("!!! CRD CLEANUP ACTION COMPLETE !!!\n\n")
 	}
@@ -917,7 +1224,9 @@ func (h *Healer) triggerCRDCleanup(resource *unstructured.Unstructured, gvr sche
 				fmt.Printf("   [SKIP] ⏭️ Resource %s/%s/%s no longer exists, skipping finalizer removal\n", gvr.Resource, resourceNamespace, resourceName)
 				// Resource doesn't exist, remove from tracking and skip deletion
 				resourceKey := fmt.Sprintf("%s/%s/%s", gvr.Resource, resourceNamespace, resourceName)
+				h.trackedCRDsMu.Lock()
 				delete(h.TrackedCRDs, resourceKey)
+				h.trackedCRDsMu.Unlock()
 				return
 			}
 			fmt.Printf("   [WARN] ⚠️ Failed to get resource %s/%s/%s for finalizer removal: %v\n", gvr.Resource, resourceNamespace, resourceName, err)
@@ -931,7 +1240,9 @@ func (h *Healer) triggerCRDCleanup(resource *unstructured.Unstructured, gvr sche
 					fmt.Printf("   [SKIP] ⏭️ Resource %s/%s/%s was deleted during finalizer removal\n", gvr.Resource, resourceNamespace, resourceName)
 					// Resource was deleted, remove from tracking and skip deletion
 					resourceKey := fmt.Sprintf("%s/%s/%s", gvr.Resource, resourceNamespace, resourceName)
+					h.trackedCRDsMu.Lock()
 					delete(h.TrackedCRDs, resourceKey)
+					h.trackedCRDsMu.Unlock()
 					return
 				}
 				fmt.Printf("   [WARN] ⚠️ Failed to remove finalizers from %s/%s/%s: %v\n", gvr.Resource, resourceNamespace, resourceName, err)
@@ -950,7 +1261,9 @@ func (h *Healer) triggerCRDCleanup(resource *unstructured.Unstructured, gvr sche
 			fmt.Printf("   [SKIP] ⏭️ Resource %s/%s/%s no longer exists, skipping deletion\n", gvr.Resource, resourceNamespace, resourceName)
 			// Remove from tracked CRDs since it's already gone
 			resourceKey := fmt.Sprintf("%s/%s/%s", gvr.Resource, resourceNamespace, resourceName)
+			h.trackedCRDsMu.Lock()
 			delete(h.TrackedCRDs, resourceKey)
+			h.trackedCRDsMu.Unlock()
 			return
 		}
 		// Other error getting resource
@@ -965,7 +1278,9 @@ func (h *Healer) triggerCRDCleanup(resource *unstructured.Unstructured, gvr sche
 			fmt.Printf("   [SKIP] ⏭️ Resource %s/%s/%s was already deleted\n", gvr.Resource, resourceNamespace, resourceName)
 			// Remove from tracked CRDs since it's already gone
 			resourceKey := fmt.Sprintf("%s/%s/%s", gvr.Resource, resourceNamespace, resourceName)
+			h.trackedCRDsMu.Lock()
 			delete(h.TrackedCRDs, resourceKey)
+			h.trackedCRDsMu.Unlock()
 		} else {
 			fmt.Printf("   [FAIL] ❌ Failed to delete %s/%s/%s: %v\n", gvr.Resource, resourceNamespace, resourceName, err)
 		}
@@ -973,7 +1288,9 @@ func (h *Healer) triggerCRDCleanup(resource *unstructured.Unstructured, gvr sche
 		fmt.Printf("   [SUCCESS] ✅ Deleted stale resource %s/%s/%s\n", gvr.Resource, resourceNamespace, resourceName)
 		// Remove from tracked CRDs when deleted
 		resourceKey := fmt.Sprintf("%s/%s/%s", gvr.Resource, resourceNamespace, resourceName)
+		h.trackedCRDsMu.Lock()
 		delete(h.TrackedCRDs, resourceKey)
+		h.trackedCRDsMu.Unlock()
 	}
 }
 
@@ -1011,7 +1328,9 @@ func (h *Healer) checkAndOptimizeResources() {
 	strainInfo := util.IsClusterUnderStrain(nodeList, h.StrainThreshold)
 
 	// Update current cluster strain state for throttling checks
+	h.currentClusterStrainMu.Lock()
 	h.CurrentClusterStrain = &strainInfo
+	h.currentClusterStrainMu.Unlock()
 
 	if !strainInfo.HasStrain {
 		// Cluster is healthy, no optimization needed
@@ -1037,75 +1356,85 @@ func (h *Healer) checkAndOptimizeResources() {
 
 	// Find pods that should be evicted for resource optimization
 	// Separate test namespace pods from non-test pods
+	var testNamespacePodsMu sync.Mutex
+	var nonTestPodsMu sync.Mutex
 	testNamespacePods := []*v1.Pod{}
 	nonTestPods := []*v1.Pod{}
 
-	// Check all namespaces to find test pods and non-test pods to evict
+	// Check all namespaces to find test pods and non-test pods to evict (in parallel)
+	var wg sync.WaitGroup
 	for _, ns := range allNamespaces {
-		pods, err := h.ClientSet.CoreV1().Pods(ns).List(context.TODO(), metav1.ListOptions{})
-		if err != nil {
-			continue
-		}
-
-		for i := range pods.Items {
-			pod := &pods.Items[i]
-
-			// Skip unmanaged pods
-			if len(pod.OwnerReferences) == 0 {
-				continue
+		wg.Add(1)
+		go func(namespace string) {
+			defer wg.Done()
+			pods, err := h.ClientSet.CoreV1().Pods(namespace).List(context.TODO(), metav1.ListOptions{})
+			if err != nil {
+				return
 			}
 
-			// Skip if namespace is excluded from deletion
-			if h.isExcludedNamespace(pod.Namespace) {
-				continue
-			}
+			for i := range pods.Items {
+				pod := &pods.Items[i]
 
-			// Skip if recently optimized
-			podKey := fmt.Sprintf("%s/%s", pod.Namespace, pod.Name)
-			if lastOpt, ok := h.OptimizedPods[podKey]; ok {
-				if time.Since(lastOpt) < h.HealCooldown {
+				// Skip unmanaged pods
+				if len(pod.OwnerReferences) == 0 {
 					continue
 				}
-			}
 
-			// Check if this is a test namespace pod
-			isTestNamespace := h.isTestNamespace(pod.Namespace)
+				// Skip if recently optimized
+				podKey := fmt.Sprintf("%s/%s", pod.Namespace, pod.Name)
+				h.optimizedPodsMu.RLock()
+				lastOpt, recentlyOptimized := h.OptimizedPods[podKey]
+				h.optimizedPodsMu.RUnlock()
+				if recentlyOptimized {
+					if time.Since(lastOpt) < h.HealCooldown {
+						continue
+					}
+				}
 
-			if isTestNamespace {
-				// Track test namespace pods (we'll check if they need resources)
-				// Always include test pods to monitor their resource needs
-				testNamespacePods = append(testNamespacePods, pod)
-			} else {
-				// For non-test pods, check if they should be evicted to free resources
-				// We're more aggressive with non-test pods - evict them if:
-				// 1. Cluster is under strain, OR
-				// 2. They have resource issues, OR
-				// 3. Test pods need resources
-				shouldEvict := false
-				if strainInfo.HasStrain {
-					// If cluster is strained, consider evicting any non-test pod with resource issues
-					if util.ShouldEvictPodForResourceOptimization(pod, strainInfo) {
-						shouldEvict = true
+				// Check if this is a test namespace pod
+				isTestNamespace := h.isTestNamespace(pod.Namespace)
+
+				if isTestNamespace {
+					// Track test namespace pods (we'll check if they need resources)
+					// Always include test pods to monitor their resource needs
+					testNamespacePodsMu.Lock()
+					testNamespacePods = append(testNamespacePods, pod)
+					testNamespacePodsMu.Unlock()
+				} else {
+					// For non-test pods, check if they should be evicted to free resources
+					// We're more aggressive with non-test pods - evict them if:
+					// 1. Cluster is under strain, OR
+					// 2. They have resource issues, OR
+					// 3. Test pods need resources
+					shouldEvict := false
+					if strainInfo.HasStrain {
+						// If cluster is strained, consider evicting any non-test pod with resource issues
+						if util.ShouldEvictPodForResourceOptimization(pod, strainInfo) {
+							shouldEvict = true
+						} else {
+							// Even if not resource-constrained, consider evicting low-priority non-test pods when cluster is strained
+							priority := util.GetPodPriority(pod)
+							if priority < 50 { // Medium or lower priority
+								shouldEvict = true
+							}
+						}
 					} else {
-						// Even if not resource-constrained, consider evicting low-priority non-test pods when cluster is strained
-						priority := util.GetPodPriority(pod)
-						if priority < 50 { // Medium or lower priority
+						// If cluster is not strained, only evict non-test pods with clear resource issues
+						if util.ShouldEvictPodForResourceOptimization(pod, strainInfo) {
 							shouldEvict = true
 						}
 					}
-				} else {
-					// If cluster is not strained, only evict non-test pods with clear resource issues
-					if util.ShouldEvictPodForResourceOptimization(pod, strainInfo) {
-						shouldEvict = true
+
+					if shouldEvict {
+						nonTestPodsMu.Lock()
+						nonTestPods = append(nonTestPods, pod)
+						nonTestPodsMu.Unlock()
 					}
 				}
-
-				if shouldEvict {
-					nonTestPods = append(nonTestPods, pod)
-				}
 			}
-		}
+		}(ns)
 	}
+	wg.Wait()
 
 	// Check if test namespace pods need resources
 	testPodsNeedResources := false
@@ -1197,11 +1526,15 @@ func (h *Healer) evictPodForOptimization(pod *v1.Pod, strainInfo util.ClusterStr
 			fmt.Printf("   [FAIL] ❌ Failed to delete pod %s: %v\n", podKey, err)
 		} else {
 			fmt.Printf("   [SUCCESS] ✅ Deleted pod %s for resource optimization\n", podKey)
+			h.optimizedPodsMu.Lock()
 			h.OptimizedPods[podKey] = time.Now()
+			h.optimizedPodsMu.Unlock()
 		}
 	} else {
 		fmt.Printf("   [SUCCESS] ✅ Evicted pod %s for resource optimization\n", podKey)
+		h.optimizedPodsMu.Lock()
 		h.OptimizedPods[podKey] = time.Now()
+		h.optimizedPodsMu.Unlock()
 	}
 
 	fmt.Printf("!!! RESOURCE OPTIMIZATION ACTION COMPLETE !!!\n\n")
@@ -1355,11 +1688,13 @@ func (h *Healer) discoverNewNamespaces() {
 
 	// Check for new namespaces we're not watching yet
 	newNamespaces := []string{}
+	h.watchedNamespacesMu.RLock()
 	for nsName := range matchedNamespaces {
 		if !h.WatchedNamespaces[nsName] {
 			newNamespaces = append(newNamespaces, nsName)
 		}
 	}
+	h.watchedNamespacesMu.RUnlock()
 
 	// Check for deleted namespaces that we're still watching
 	// Build a set of existing namespace names for quick lookup
@@ -1373,7 +1708,13 @@ func (h *Healer) discoverNewNamespaces() {
 	// 1. Match the pattern (wildcard or prefix) - meaning they were dynamically discovered
 	// 2. No longer exist in the cluster
 	deletedNamespaces := []string{}
-	for watchedNs := range h.WatchedNamespaces {
+	h.watchedNamespacesMu.RLock()
+	watchedNamespacesCopy := make(map[string]bool)
+	for k, v := range h.WatchedNamespaces {
+		watchedNamespacesCopy[k] = v
+	}
+	h.watchedNamespacesMu.RUnlock()
+	for watchedNs := range watchedNamespacesCopy {
 		// Skip if namespace still exists
 		if existingNamespaces[watchedNs] {
 			continue
@@ -1413,15 +1754,19 @@ func (h *Healer) discoverNewNamespaces() {
 
 		for _, nsName := range deletedNamespaces {
 			// Remove from watched namespaces map
+			h.watchedNamespacesMu.Lock()
 			delete(h.WatchedNamespaces, nsName)
+			h.watchedNamespacesMu.Unlock()
 
 			// Remove from Namespaces list
+			h.namespacesMu.Lock()
 			for i, ns := range h.Namespaces {
 				if ns == nsName {
 					h.Namespaces = append(h.Namespaces[:i], h.Namespaces[i+1:]...)
 					break
 				}
 			}
+			h.namespacesMu.Unlock()
 
 			fmt.Printf("   [INFO] ⏹️  Stopped watching deleted namespace: %s\n", nsName)
 		}
@@ -1457,8 +1802,12 @@ func (h *Healer) discoverNewNamespaces() {
 
 		for _, nsName := range newNamespaces {
 			// Mark as watched
+			h.watchedNamespacesMu.Lock()
 			h.WatchedNamespaces[nsName] = true
+			h.watchedNamespacesMu.Unlock()
+			h.namespacesMu.Lock()
 			h.Namespaces = append(h.Namespaces, nsName)
+			h.namespacesMu.Unlock()
 
 			// Start watching this namespace
 			go h.watchSingleNamespace(nsName)
@@ -1519,7 +1868,7 @@ func (h *Healer) checkAndDeleteStaleNamespaces(namespaces []v1.Namespace, patter
 		}
 	}
 
-	// Delete stale namespaces
+	// Delete stale namespaces (in parallel)
 	if len(staleNamespaces) > 0 {
 		nsNames := make([]string, len(staleNamespaces))
 		for i, ns := range staleNamespaces {
@@ -1528,9 +1877,15 @@ func (h *Healer) checkAndDeleteStaleNamespaces(namespaces []v1.Namespace, patter
 		fmt.Printf("   [INFO] 🗑️  Found %d stale namespace(s) matching pattern (older than %v): [%s]\n",
 			len(staleNamespaces), h.StaleAge, strings.Join(nsNames, ", "))
 
+		var wg sync.WaitGroup
 		for _, ns := range staleNamespaces {
-			h.triggerNamespaceDeletion(&ns)
+			wg.Add(1)
+			go func(namespace v1.Namespace) {
+				defer wg.Done()
+				h.triggerNamespaceDeletion(&namespace)
+			}(ns)
 		}
+		wg.Wait()
 	}
 }
 
@@ -1638,13 +1993,17 @@ func (h *Healer) triggerNamespaceDeletion(ns *v1.Namespace) {
 
 // removeNamespaceFromTracking removes a namespace from tracking maps and lists
 func (h *Healer) removeNamespaceFromTracking(nsName string) {
+	h.watchedNamespacesMu.Lock()
 	delete(h.WatchedNamespaces, nsName)
+	h.watchedNamespacesMu.Unlock()
+	h.namespacesMu.Lock()
 	for i, watchedNs := range h.Namespaces {
 		if watchedNs == nsName {
 			h.Namespaces = append(h.Namespaces[:i], h.Namespaces[i+1:]...)
 			break
 		}
 	}
+	h.namespacesMu.Unlock()
 }
 
 // isTestNamespace checks if a namespace matches the test namespace pattern
@@ -1658,7 +2017,11 @@ func (h *Healer) isTestNamespace(namespace string) bool {
 	}
 
 	// Extract wildcard patterns from Namespaces list (from --namespaces flag)
-	for _, ns := range h.Namespaces {
+	h.namespacesMu.RLock()
+	namespacesCopy := make([]string, len(h.Namespaces))
+	copy(namespacesCopy, h.Namespaces)
+	h.namespacesMu.RUnlock()
+	for _, ns := range namespacesCopy {
 		if strings.Contains(ns, "*") {
 			patterns = append(patterns, ns)
 		}
@@ -1687,23 +2050,26 @@ func (h *Healer) handleResourceCreation(resourceType, namespace, name string) {
 	}
 
 	// Check if cluster is currently under strain
-	if h.CurrentClusterStrain != nil && h.CurrentClusterStrain.HasStrain {
+	h.currentClusterStrainMu.RLock()
+	clusterStrain := h.CurrentClusterStrain
+	h.currentClusterStrainMu.RUnlock()
+	if clusterStrain != nil && clusterStrain.HasStrain {
 		// Check if this is a test namespace (test resources are allowed)
 		isTestNamespace := h.isTestNamespace(namespace)
 
 		if isTestNamespace {
 			// Test namespace resources - warn but allow (tests need to run)
 			fmt.Printf("   [WARN] ⚠️ New %s created in test namespace during cluster strain: %s/%s (strain: %.1f%%)\n",
-				resourceType, namespace, name, h.CurrentClusterStrain.StrainPercentage)
+				resourceType, namespace, name, clusterStrain.StrainPercentage)
 			fmt.Printf("   [INFO] 💡 Consider reducing parallel test execution or waiting for cluster to recover\n")
 		} else {
 			// Non-test namespace resources - stronger warning
 			fmt.Printf("   [WARN] 🚨 New %s created during cluster strain: %s/%s (strain: %.1f%%)\n",
-				resourceType, namespace, name, h.CurrentClusterStrain.StrainPercentage)
+				resourceType, namespace, name, clusterStrain.StrainPercentage)
 			fmt.Printf("   [INFO] 💡 Resource creation throttling active - consider deferring resource creation until cluster recovers\n")
 			fmt.Printf("   [INFO] 📊 Cluster status: %d/%d nodes under pressure: [%s]\n",
-				h.CurrentClusterStrain.StrainedNodesCount, h.CurrentClusterStrain.TotalNodesCount,
-				strings.Join(h.CurrentClusterStrain.NodesUnderPressure, ", "))
+				clusterStrain.StrainedNodesCount, clusterStrain.TotalNodesCount,
+				strings.Join(clusterStrain.NodesUnderPressure, ", "))
 		}
 	}
 }

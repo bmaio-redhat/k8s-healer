@@ -40,6 +40,10 @@ var (
 	pidFile                          string
 	logFile                          string
 	discoverEndpoints                bool
+	warmupTimeout                    time.Duration
+	memoryLimitMB                    uint
+	memoryCheckInterval              time.Duration
+	restartOnMemoryLimit             bool
 )
 
 // rootCmd represents the base command when called without any subcommands
@@ -116,6 +120,14 @@ func init() {
 		"Discover and display all available API endpoints and resources in the cluster, then exit.")
 	rootCmd.PersistentFlags().StringVarP(&excludeNamespaces, "exclude-namespaces", "e", "",
 		"Comma-separated list of namespaces to exclude from prefix-based discovery (e.g., 'test-keep,test-important').")
+	rootCmd.PersistentFlags().DurationVarP(&warmupTimeout, "warmup-timeout", "w", 30*time.Second,
+		"Timeout for cluster warm-up phase - validates CRD availability and API connectivity before starting heavy operations (e.g., 30s, 1m). Set to 0 to disable warm-up. Default: 30s.")
+	rootCmd.PersistentFlags().UintVar(&memoryLimitMB, "memory-limit-mb", 40,
+		"Maximum heap size in MB before sanitizing references and optionally restarting (e.g. 50). Default: 40. Set to 0 to disable. When exceeded, tracking maps are cleared and GC run; if still over limit and --restart-on-memory-limit is set, process exits for restart.")
+	rootCmd.PersistentFlags().DurationVar(&memoryCheckInterval, "memory-check-interval", 1*time.Minute,
+		"How often to check memory when --memory-limit-mb is set (e.g. 1m, 30s). Default: 1m.")
+	rootCmd.PersistentFlags().BoolVar(&restartOnMemoryLimit, "restart-on-memory-limit", true,
+		"When memory limit is exceeded and sanitization does not bring usage below limit, exit process with code 0 so a process manager can restart. Default: true when using --memory-limit-mb.")
 
 	// Daemon management subcommands
 	rootCmd.AddCommand(daemonStartCmd)
@@ -127,19 +139,19 @@ func init() {
 // For example, "test-123" -> "test-", "e2e-456" -> "e2e-".
 func extractPrefixesFromNamespaces(namespaces []string) map[string]bool {
 	prefixes := make(map[string]bool)
-	
+
 	for _, ns := range namespaces {
 		// Skip wildcard patterns (they're handled separately)
 		if strings.Contains(ns, "*") {
 			continue
 		}
-		
+
 		// Extract prefix: find the last separator (hyphen, underscore, or dot)
 		// and use everything before it as the prefix
 		lastHyphen := strings.LastIndex(ns, "-")
 		lastUnderscore := strings.LastIndex(ns, "_")
 		lastDot := strings.LastIndex(ns, ".")
-		
+
 		lastSeparator := -1
 		if lastHyphen > lastSeparator {
 			lastSeparator = lastHyphen
@@ -150,14 +162,14 @@ func extractPrefixesFromNamespaces(namespaces []string) map[string]bool {
 		if lastDot > lastSeparator {
 			lastSeparator = lastDot
 		}
-		
+
 		// If we found a separator, extract the prefix
 		if lastSeparator > 0 && lastSeparator < len(ns)-1 {
 			prefix := ns[:lastSeparator+1] // Include the separator
 			prefixes[prefix] = true
 		}
 	}
-	
+
 	return prefixes
 }
 
@@ -189,7 +201,7 @@ func resolveWildcardNamespaces(kubeconfigPath, namespacesInput string, excludedN
 			break
 		}
 	}
-	
+
 	// Also check if we have non-wildcard namespaces that need prefix-based discovery
 	prefixes := extractPrefixesFromNamespaces(patterns)
 	if len(prefixes) > 0 {
@@ -258,7 +270,7 @@ func resolveWildcardNamespaces(kubeconfigPath, namespacesInput string, excludedN
 				}
 			}
 		}
-		
+
 		// Match against prefixes (if not already matched)
 		if !resolvedNamespaces[ns.Name] {
 			for prefix := range prefixes {
@@ -370,6 +382,13 @@ func getDaemonArgs() []string {
 	if excludeNamespaces != "" {
 		args = append(args, "--exclude-namespaces", excludeNamespaces)
 	}
+	if memoryLimitMB > 0 {
+		args = append(args, "--memory-limit-mb", fmt.Sprintf("%d", memoryLimitMB))
+		args = append(args, "--memory-check-interval", memoryCheckInterval.String())
+		if !restartOnMemoryLimit {
+			args = append(args, "--restart-on-memory-limit=false")
+		}
+	}
 	// Add daemon flag so the child process knows it's running as daemon
 	args = append(args, "--daemon")
 	args = append(args, "--pid-file", pidFile)
@@ -395,7 +414,7 @@ func startHealer() {
 			fmt.Printf("Warning: Failed to redirect output to log file: %v\n", err)
 		}
 	}
-	
+
 	// Parse excluded namespaces
 	var excludedNsList []string
 	if excludeNamespaces != "" {
@@ -407,7 +426,7 @@ func startHealer() {
 			}
 		}
 	}
-	
+
 	// Resolve the raw namespace input (including wildcards and prefixes) into a concrete list of existing namespaces
 	nsList, err := resolveWildcardNamespaces(kubeconfigPath, namespaces, excludedNsList)
 	if err != nil {
@@ -490,23 +509,53 @@ func startHealer() {
 	healer.EnableResourceOptimization = enableResourceOptimization
 	healer.EnableResourceCreationThrottling = enableResourceCreationThrottling
 	healer.StrainThreshold = strainThreshold
+	if memoryLimitMB > 0 {
+		healer.MemoryLimitMB = uint64(memoryLimitMB)
+		healer.MemoryCheckInterval = memoryCheckInterval
+		healer.RestartOnMemoryLimit = restartOnMemoryLimit
+		fmt.Printf("Memory limit: %d MB (check every %v, restart on limit: %v)\n", memoryLimitMB, memoryCheckInterval, restartOnMemoryLimit)
+	}
+	// Warm up the cluster if enabled (validates CRD availability before heavy operations)
+	if warmupTimeout > 0 {
+		fmt.Printf("\n🔥 Warming up cluster (timeout: %v)...\n", warmupTimeout)
+		if err := healer.Warmup(warmupTimeout); err != nil {
+			fmt.Printf("⚠️  Warning: Cluster warm-up completed with issues: %v\n", err)
+			fmt.Printf("   Continuing anyway - some CRD resources may not be available yet.\n")
+		} else {
+			fmt.Printf("✅ Cluster warm-up completed successfully - ready for heavy operations!\n\n")
+		}
+	}
+
 	// Setup signal handling (SIGINT/Ctrl+C and SIGTERM) for graceful shutdown.
 	termCh := make(chan os.Signal, 1)
 	signal.Notify(termCh, syscall.SIGINT, syscall.SIGTERM)
 
 	// Start the main watch loop in a goroutine. This will start the informers.
-	go healer.Watch()
+	watchDone := make(chan struct{})
+	go func() {
+		healer.Watch()
+		close(watchDone)
+	}()
 
-	// Wait for termination signal
-	<-termCh
-	fmt.Println("\nTermination signal received. Shutting down healer...")
+	// Wait for termination signal or memory-limit restart request
+	select {
+	case <-termCh:
+		fmt.Println("\nTermination signal received. Shutting down healer...")
+	case <-healer.RestartRequested:
+		fmt.Println("\nMemory limit exceeded after sanitization — exiting for restart...")
+	}
 
 	// Close the StopCh channel to signal all concurrent informers to stop gracefully.
 	close(healer.StopCh)
 
 	// Give informers a moment to stop before exiting the process.
+	<-watchDone
 	time.Sleep(1 * time.Second)
 	fmt.Println("Healer stopped.")
+
+	if healer.IsRestartRequested() {
+		os.Exit(0) // Exit 0 so process manager (e.g. systemd, k8s) restarts the process
+	}
 }
 
 func main() {
