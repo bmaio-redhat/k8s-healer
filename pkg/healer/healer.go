@@ -94,6 +94,15 @@ func NewHealer(kubeconfigPath string, namespaces []string, enableVMHealing bool,
 		return nil, fmt.Errorf("failed to build Kubernetes config: %w", err)
 	}
 
+	// Raise client rate limits to reduce "rate limiter Wait would exceed context deadline" under load.
+	// Defaults are low; we do many parallel list/delete operations across namespaces.
+	if config.QPS == 0 {
+		config.QPS = 20
+	}
+	if config.Burst == 0 {
+		config.Burst = 50
+	}
+
 	// Create the clientset used for making API calls
 	clientset, err := kubernetes.NewForConfig(config)
 	if err != nil {
@@ -1205,48 +1214,84 @@ func (h *Healer) checkAndCleanupCRDResource(resource *unstructured.Unstructured,
 	}
 }
 
-// triggerCRDCleanup performs cleanup actions on a stale CRD resource
-func (h *Healer) triggerCRDCleanup(resource *unstructured.Unstructured, gvr schema.GroupVersionResource) {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second*30)
-	defer cancel()
+// isRateLimitError returns true if the error is from the client rate limiter (e.g. "would exceed context deadline").
+func isRateLimitError(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	return strings.Contains(s, "rate") && (strings.Contains(s, "Wait") || strings.Contains(s, "limiter") || strings.Contains(s, "would exceed context deadline"))
+}
 
+// triggerCRDCleanup performs cleanup actions on a stale CRD resource. Uses a longer timeout and retries
+// on rate-limit errors so we don't fail when the cluster rate limiter is under load.
+func (h *Healer) triggerCRDCleanup(resource *unstructured.Unstructured, gvr schema.GroupVersionResource) {
 	resourceName := resource.GetName()
 	resourceNamespace := resource.GetNamespace()
+	resourceKey := fmt.Sprintf("%s/%s/%s", gvr.Resource, resourceNamespace, resourceName)
 
+	// Short delay to spread load when many cleanups run in parallel (reduces rate limit spikes).
+	time.Sleep(100 * time.Millisecond)
+
+	const maxRetries = 3
+	backoff := []time.Duration{2 * time.Second, 4 * time.Second, 8 * time.Second}
+
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		// Use a long timeout so rate limiter Wait has time to complete (default 30s was too short under load).
+		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+		done, err := h.doCRDCleanup(ctx, resource, gvr, resourceName, resourceNamespace, resourceKey)
+		cancel()
+		if done {
+			return
+		}
+		if err != nil && isRateLimitError(err) && attempt < maxRetries-1 {
+			fmt.Printf("   [WARN] ⚠️ Rate limited, retrying in %v (attempt %d/%d): %v\n", backoff[attempt], attempt+1, maxRetries, err)
+			time.Sleep(backoff[attempt])
+			continue
+		}
+		if err != nil {
+			fmt.Printf("   [FAIL] ❌ Failed to delete %s/%s/%s after %d attempt(s): %v\n", gvr.Resource, resourceNamespace, resourceName, attempt+1, err)
+		}
+		return
+	}
+}
+
+// doCRDCleanup runs one attempt of CRD cleanup. Returns (true, nil) when done (success or skip), (false, err) when a retriable error occurred.
+func (h *Healer) doCRDCleanup(ctx context.Context, resource *unstructured.Unstructured, gvr schema.GroupVersionResource, resourceName, resourceNamespace, resourceKey string) (done bool, err error) {
 	// If cleanup finalizers is enabled and resource has finalizers, remove them first
 	if h.CleanupFinalizers && len(resource.GetFinalizers()) > 0 {
 		fmt.Printf("   [INFO] 🔄 Removing finalizers from %s/%s/%s...\n", gvr.Resource, resourceNamespace, resourceName)
 
-		// Get the current resource to update
-		currentResource, err := h.DynamicClient.Resource(gvr).Namespace(resourceNamespace).Get(ctx, resourceName, metav1.GetOptions{})
-		if err != nil {
-			if apierrors.IsNotFound(err) {
+		currentResource, getErr := h.DynamicClient.Resource(gvr).Namespace(resourceNamespace).Get(ctx, resourceName, metav1.GetOptions{})
+		if getErr != nil {
+			if apierrors.IsNotFound(getErr) {
 				fmt.Printf("   [SKIP] ⏭️ Resource %s/%s/%s no longer exists, skipping finalizer removal\n", gvr.Resource, resourceNamespace, resourceName)
-				// Resource doesn't exist, remove from tracking and skip deletion
-				resourceKey := fmt.Sprintf("%s/%s/%s", gvr.Resource, resourceNamespace, resourceName)
 				h.trackedCRDsMu.Lock()
 				delete(h.TrackedCRDs, resourceKey)
 				h.trackedCRDsMu.Unlock()
-				return
+				return true, nil
 			}
-			fmt.Printf("   [WARN] ⚠️ Failed to get resource %s/%s/%s for finalizer removal: %v\n", gvr.Resource, resourceNamespace, resourceName, err)
+			fmt.Printf("   [WARN] ⚠️ Failed to get resource %s/%s/%s for finalizer removal: %v\n", gvr.Resource, resourceNamespace, resourceName, getErr)
 			fmt.Printf("   [INFO] 🔄 Proceeding with deletion anyway...\n")
+			if isRateLimitError(getErr) {
+				return false, getErr
+			}
 		} else {
-			// Remove all finalizers
 			currentResource.SetFinalizers([]string{})
-			_, err = h.DynamicClient.Resource(gvr).Namespace(resourceNamespace).Update(ctx, currentResource, metav1.UpdateOptions{})
-			if err != nil {
-				if apierrors.IsNotFound(err) {
+			_, updateErr := h.DynamicClient.Resource(gvr).Namespace(resourceNamespace).Update(ctx, currentResource, metav1.UpdateOptions{})
+			if updateErr != nil {
+				if apierrors.IsNotFound(updateErr) {
 					fmt.Printf("   [SKIP] ⏭️ Resource %s/%s/%s was deleted during finalizer removal\n", gvr.Resource, resourceNamespace, resourceName)
-					// Resource was deleted, remove from tracking and skip deletion
-					resourceKey := fmt.Sprintf("%s/%s/%s", gvr.Resource, resourceNamespace, resourceName)
 					h.trackedCRDsMu.Lock()
 					delete(h.TrackedCRDs, resourceKey)
 					h.trackedCRDsMu.Unlock()
-					return
+					return true, nil
 				}
-				fmt.Printf("   [WARN] ⚠️ Failed to remove finalizers from %s/%s/%s: %v\n", gvr.Resource, resourceNamespace, resourceName, err)
+				fmt.Printf("   [WARN] ⚠️ Failed to remove finalizers from %s/%s/%s: %v\n", gvr.Resource, resourceNamespace, resourceName, updateErr)
 				fmt.Printf("   [INFO] 🔄 Proceeding with deletion anyway...\n")
+				if isRateLimitError(updateErr) {
+					return false, updateErr
+				}
 			} else {
 				fmt.Printf("   [SUCCESS] ✅ Removed finalizers from %s/%s/%s\n", gvr.Resource, resourceNamespace, resourceName)
 			}
@@ -1254,44 +1299,42 @@ func (h *Healer) triggerCRDCleanup(resource *unstructured.Unstructured, gvr sche
 	}
 
 	// Check if resource still exists before attempting deletion
-	_, err := h.DynamicClient.Resource(gvr).Namespace(resourceNamespace).Get(ctx, resourceName, metav1.GetOptions{})
-	if err != nil {
-		// Resource doesn't exist or was already deleted
-		if apierrors.IsNotFound(err) {
+	_, getErr := h.DynamicClient.Resource(gvr).Namespace(resourceNamespace).Get(ctx, resourceName, metav1.GetOptions{})
+	if getErr != nil {
+		if apierrors.IsNotFound(getErr) {
 			fmt.Printf("   [SKIP] ⏭️ Resource %s/%s/%s no longer exists, skipping deletion\n", gvr.Resource, resourceNamespace, resourceName)
-			// Remove from tracked CRDs since it's already gone
-			resourceKey := fmt.Sprintf("%s/%s/%s", gvr.Resource, resourceNamespace, resourceName)
 			h.trackedCRDsMu.Lock()
 			delete(h.TrackedCRDs, resourceKey)
 			h.trackedCRDsMu.Unlock()
-			return
+			return true, nil
 		}
-		// Other error getting resource
-		fmt.Printf("   [WARN] ⚠️ Failed to check if resource %s/%s/%s exists: %v\n", gvr.Resource, resourceNamespace, resourceName, err)
-		// Continue with deletion attempt anyway
+		fmt.Printf("   [WARN] ⚠️ Failed to check if resource %s/%s/%s exists: %v\n", gvr.Resource, resourceNamespace, resourceName, getErr)
+		if isRateLimitError(getErr) {
+			return false, getErr
+		}
 	}
 
 	// Delete the resource
-	err = h.DynamicClient.Resource(gvr).Namespace(resourceNamespace).Delete(ctx, resourceName, metav1.DeleteOptions{})
-	if err != nil {
-		if apierrors.IsNotFound(err) {
+	delErr := h.DynamicClient.Resource(gvr).Namespace(resourceNamespace).Delete(ctx, resourceName, metav1.DeleteOptions{})
+	if delErr != nil {
+		if apierrors.IsNotFound(delErr) {
 			fmt.Printf("   [SKIP] ⏭️ Resource %s/%s/%s was already deleted\n", gvr.Resource, resourceNamespace, resourceName)
-			// Remove from tracked CRDs since it's already gone
-			resourceKey := fmt.Sprintf("%s/%s/%s", gvr.Resource, resourceNamespace, resourceName)
 			h.trackedCRDsMu.Lock()
 			delete(h.TrackedCRDs, resourceKey)
 			h.trackedCRDsMu.Unlock()
-		} else {
-			fmt.Printf("   [FAIL] ❌ Failed to delete %s/%s/%s: %v\n", gvr.Resource, resourceNamespace, resourceName, err)
+			return true, nil
 		}
-	} else {
-		fmt.Printf("   [SUCCESS] ✅ Deleted stale resource %s/%s/%s\n", gvr.Resource, resourceNamespace, resourceName)
-		// Remove from tracked CRDs when deleted
-		resourceKey := fmt.Sprintf("%s/%s/%s", gvr.Resource, resourceNamespace, resourceName)
-		h.trackedCRDsMu.Lock()
-		delete(h.TrackedCRDs, resourceKey)
-		h.trackedCRDsMu.Unlock()
+		if isRateLimitError(delErr) {
+			return false, delErr
+		}
+		fmt.Printf("   [FAIL] ❌ Failed to delete %s/%s/%s: %v\n", gvr.Resource, resourceNamespace, resourceName, delErr)
+		return true, nil
 	}
+	fmt.Printf("   [SUCCESS] ✅ Deleted stale resource %s/%s/%s\n", gvr.Resource, resourceNamespace, resourceName)
+	h.trackedCRDsMu.Lock()
+	delete(h.TrackedCRDs, resourceKey)
+	h.trackedCRDsMu.Unlock()
+	return true, nil
 }
 
 // watchResourceOptimization periodically checks cluster resource strain and optimizes pods
