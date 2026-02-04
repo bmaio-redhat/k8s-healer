@@ -1,6 +1,6 @@
 # Build stage
-# Using latest alpine for Go (will use latest stable Go version)
-FROM golang:alpine AS builder
+# Go version is constrained by go.mod; use matching Alpine image for reproducible builds
+FROM golang:1.22-alpine AS builder
 
 # Install git and ca-certificates (needed for some Go modules and SSL)
 RUN apk add --no-cache git ca-certificates

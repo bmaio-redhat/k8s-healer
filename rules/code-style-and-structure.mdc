@@ -1,0 +1,68 @@
+---
+description: k8s-healer Go code style, structure, naming, and conventions for implementation and tests
+globs: "**/*.go"
+alwaysApply: false
+---
+
+# k8s-healer Code Style and Structure (Cursor Rules)
+
+Follow these rules when editing or generating Go code in this project.
+
+## Project layout
+
+- **cmd/main.go**: CLI only (cobra, flags, wiring). No business logic.
+- **pkg/healer**: Core healing, CRD cleanup, namespaces, memory guard.
+- **pkg/util**: Shared checks (pods, nodes, VMs, CRDs, cluster strain, eviction).
+- **pkg/daemon**: Daemonization, PID file, log redirection.
+- **pkg/healthcheck**: Cluster health checks and status formatting.
+- **pkg/discovery**: Cluster endpoint discovery.
+
+## Naming
+
+- **Exported**: `PascalCase` (types, functions, constants).
+- **Unexported**: `camelCase` (functions, vars, fields).
+- **Mutexes**: unexported, suffix `Mu` (e.g. `healedPodsMu`, `trackedCRDsMu`).
+- **Test files**: `*_test.go`; split by theme when large (e.g. `healer_namespaces_test.go`, `checks_vm_crd_test.go`).
+- **Test names**: `Test<Name>` or `Test<Receiver>_<Method>_<Scenario>` (e.g. `TestHealer_DoCRDCleanup_ResourceNotFound`).
+
+## Code structure
+
+- Imports: stdlib, blank line, third-party, blank line, project (`github.com/bmaio-redhat/k8s-healer/pkg/...`).
+- In a file: package clause → imports → constants/vars → exported types/funcs → unexported.
+- Document every exported type, function, and method (doc comment starting with the name).
+- Use inline comments for non-obvious logic or invariants.
+
+## Errors and concurrency
+
+- Wrap errors: `fmt.Errorf("message: %w", err)`.
+- Use `apierrors.IsNotFound(err)` (and similar) for API errors, not string matching.
+- Protect shared maps/slices with `sync.RWMutex`; name mutex after the field (e.g. `healedPodsMu` for `HealedPods`).
+- Use `RLock`/`RUnlock` for reads, `Lock`/`Unlock` for writes.
+- Signal one-off events with `chan struct{}` (close to signal) or atomic/sync.Once.
+
+## Testing
+
+- Tests in same package (`package healer`, `package util`, etc.).
+- Shared helpers in main `*_test.go` (e.g. `createTestHealer`, `createTestHealerWithExclusions`).
+- Use table-driven tests for multiple cases.
+- Use `k8s.io/client-go/kubernetes/fake` and `k8s.io/client-go/dynamic/fake`; for dynamic list, use `NewSimpleDynamicClientWithCustomListKinds` and register list kinds.
+
+## Logging
+
+- Use consistent prefixes: `[Check]`, `[INFO]`, `[WARN]`, `[FAIL]`, `[SKIP]`, `[SUCCESS]`.
+- Include resource identifiers (namespace/name, GVR) in messages.
+
+## Configuration and CLI
+
+- Defaults in one place (constructors or cmd/main.go).
+- CLI flags: kebab-case in help (`--enable-vm-healing`); Go vars: camelCase (`enableVMHealing`).
+
+## Do not
+
+- Add business logic in cmd/.
+- Use string matching for API errors when `apierrors` helpers exist.
+- Expose mutexes or use bare maps/slices for shared state without a mutex.
+- Skip doc comments on exported symbols.
+- Introduce new dependencies without need; prefer stdlib and existing k8s.io deps.
+
+Reference: project root **STYLE.md** and **CONTRIBUTING.md** for full guidelines and design philosophy.

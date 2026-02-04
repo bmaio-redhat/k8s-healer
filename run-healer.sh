@@ -32,7 +32,7 @@ NC='\033[0m' # No Color
 # Check if binary exists
 if [ ! -f "$HEALER_BINARY" ]; then
     echo -e "${RED}Error: k8s-healer binary not found at $HEALER_BINARY${NC}"
-    echo "Please build it first with: go build -o k8s-healer ./cmd/main.go"
+    echo "Build with: make build  (or: go build -o k8s-healer ./cmd/main.go)"
     exit 1
 fi
 
@@ -214,7 +214,7 @@ show_help() {
     echo "  Source Kubeconfig: $SOURCE_KUBECONFIG"
     echo "  Namespaces: ${NAMESPACES:-all}"
     echo "  CRD Resources: $CRD_RESOURCES"
-    echo "  Stale Age: 3 minutes"
+    echo "  Stale Age: 6 minutes"
     echo ""
     echo "Examples:"
     echo "  $0 start                    # Start as daemon (background)"

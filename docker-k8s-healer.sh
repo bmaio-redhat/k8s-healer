@@ -1,10 +1,12 @@
 #!/bin/bash
 
 # Wrapper script for running k8s-healer in Docker/Podman
+# Build the image first: make docker-build  (or: docker build -t k8s-healer .)
 # Automatically handles volume mounting for kubeconfig files
-# Automatically prefers Podman and falls back to Docker if Podman is not available
+# Prefers Podman, falls back to Docker
 # Usage: docker-k8s-healer.sh [docker|podman] [k8s-healer args...]
-#        Or: ./docker-k8s-healer.sh -k /path/to/kubeconfig -n "pw-*" (auto-detects podman/docker)
+#        Or: ./docker-k8s-healer.sh -k /path/to/kubeconfig -n "pw-*"
+# Daemon: ./docker-k8s-healer.sh -k /path/to/kubeconfig start --pid-file /tmp/healer.pid --log-file /tmp/healer.log
 
 set -e
 
