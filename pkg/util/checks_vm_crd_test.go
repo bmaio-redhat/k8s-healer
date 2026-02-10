@@ -166,6 +166,24 @@ func TestIsCRDResourceStale(t *testing.T) {
 			expected:        true,
 		},
 		{
+			name: "resource stuck in terminating (force-delete even when checkFinalizers false)",
+			resource: &unstructured.Unstructured{
+				Object: map[string]interface{}{
+					"metadata": map[string]interface{}{
+						"name":              "terminating-resource-no-flag",
+						"namespace":         "default",
+						"creationTimestamp": now.Add(-1 * time.Minute).Format(time.RFC3339),
+						"deletionTimestamp": now.Add(-10 * time.Minute).Format(time.RFC3339),
+						"finalizers":        []interface{}{"finalizer.example.com"},
+					},
+					"status": map[string]interface{}{},
+				},
+			},
+			staleAge:        staleAge,
+			checkFinalizers: false,
+			expected:        true,
+		},
+		{
 			name: "resource with error phase",
 			resource: &unstructured.Unstructured{
 				Object: map[string]interface{}{

@@ -366,17 +366,14 @@ func IsCRDResourceStale(resource *unstructured.Unstructured, staleAge time.Durat
 		return true
 	}
 
-	// Check for stuck finalizers
-	if checkFinalizers && len(resource.GetFinalizers()) > 0 {
-		// Check if resource has been in terminating state for too long (indicates stuck finalizers)
-		deletionTimestamp := resource.GetDeletionTimestamp()
-		if deletionTimestamp != nil {
-			terminatingDuration := time.Since(deletionTimestamp.Time)
-			if terminatingDuration > staleAge {
-				fmt.Printf("   [Check] 🚨 CRD Resource %s/%s failed check: Stuck in terminating state for %v (likely stuck finalizers).\n",
-					resourceNamespace, resourceName, terminatingDuration)
-				return true
-			}
+	// Check if resource has been stuck in terminating state for too long (always force-clean these)
+	deletionTimestamp := resource.GetDeletionTimestamp()
+	if deletionTimestamp != nil {
+		terminatingDuration := time.Since(deletionTimestamp.Time)
+		if terminatingDuration > staleAge {
+			fmt.Printf("   [Check] 🚨 CRD Resource %s/%s failed check: Stuck in terminating state for %v (likely stuck finalizers).\n",
+				resourceNamespace, resourceName, terminatingDuration)
+			return true
 		}
 	}
 
@@ -491,18 +488,18 @@ func GetCRDResourceStaleReason(resource *unstructured.Unstructured, staleAge tim
 		return fmt.Sprintf("Resource older than stale age threshold (%v old)", time.Since(creationTime.Time))
 	}
 
-	// Check stuck finalizers
-	if checkFinalizers {
-		deletionTimestamp := resource.GetDeletionTimestamp()
-		if deletionTimestamp != nil {
-			terminatingDuration := time.Since(deletionTimestamp.Time)
-			if terminatingDuration > staleAge {
-				return fmt.Sprintf("Stuck in terminating state for %v (likely stuck finalizers: %v)", terminatingDuration, resource.GetFinalizers())
-			}
+	// Stuck in terminating (always report so we force-clean)
+	deletionTimestamp := resource.GetDeletionTimestamp()
+	if deletionTimestamp != nil {
+		terminatingDuration := time.Since(deletionTimestamp.Time)
+		if terminatingDuration > staleAge {
+			return fmt.Sprintf("Stuck in terminating state for %v (likely stuck finalizers: %v)", terminatingDuration, resource.GetFinalizers())
 		}
-		if len(resource.GetFinalizers()) > 0 {
-			return fmt.Sprintf("Has finalizers that may be stuck: %v", resource.GetFinalizers())
-		}
+	}
+
+	// Other finalizer-related reasons when finalizer checks are enabled
+	if checkFinalizers && len(resource.GetFinalizers()) > 0 {
+		return fmt.Sprintf("Has finalizers that may be stuck: %v", resource.GetFinalizers())
 	}
 
 	// Check error conditions

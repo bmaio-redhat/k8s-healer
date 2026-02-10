@@ -13,14 +13,15 @@ coverage.html
 .gitignore
 .gitattributes
 
-# Documentation (not needed in container)
+# Documentation and tooling (not needed in container)
 README.md
 CONTRIBUTING.md
+STYLE.md
 LICENSE
-
-# Scripts (not needed in container)
-run-healer.sh
+rules/
 Makefile
+run-healer.sh
+docker-k8s-healer.sh
 
 # IDE files
 .vscode

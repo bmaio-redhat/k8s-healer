@@ -76,6 +76,10 @@ type Healer struct {
 	MemoryReadFunc func() uint64
 }
 
+// forceDeleteOptions is used for all deletions so stale/terminating resources are removed immediately (no grace period).
+var gracePeriodZero int64 = 0
+var forceDeleteOptions = metav1.DeleteOptions{GracePeriodSeconds: &gracePeriodZero}
+
 // NewHealer initializes the Kubernetes client configuration using kubeconfig or in-cluster settings.
 func NewHealer(kubeconfigPath string, namespaces []string, enableVMHealing bool, enableCRDCleanup bool, crdResources []string, enableNamespacePolling bool, namespacePattern string, namespacePollInterval time.Duration, excludedNamespaces []string) (*Healer, error) {
 	var config *rest.Config
@@ -724,8 +728,8 @@ func (h *Healer) triggerPodDeletion(pod *v1.Pod) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second*10)
 	defer cancel()
 
-	// Perform the API Delete call
-	err := h.ClientSet.CoreV1().Pods(pod.Namespace).Delete(ctx, pod.Name, metav1.DeleteOptions{})
+	// Perform the API Delete call (force delete: no grace period, so terminating pods are removed immediately)
+	err := h.ClientSet.CoreV1().Pods(pod.Namespace).Delete(ctx, pod.Name, forceDeleteOptions)
 
 	if err != nil {
 		fmt.Printf("   [FAIL] ❌ Failed to delete pod %s/%s: %v\n", pod.Namespace, pod.Name, err)
@@ -808,8 +812,8 @@ func (h *Healer) triggerNodeHealing(node *v1.Node) {
 		fmt.Printf("   [INFO] 🔄 Proceeding with node deletion anyway...\n")
 	}
 
-	// Delete the node
-	err = h.ClientSet.CoreV1().Nodes().Delete(ctx, node.Name, metav1.DeleteOptions{})
+	// Delete the node (force delete: no grace period)
+	err = h.ClientSet.CoreV1().Nodes().Delete(ctx, node.Name, forceDeleteOptions)
 	if err != nil {
 		fmt.Printf("   [FAIL] ❌ Failed to delete node %s: %v\n", node.Name, err)
 	} else {
@@ -997,8 +1001,8 @@ func (h *Healer) triggerVirtualMachineHealing(vm *unstructured.Unstructured) {
 		Resource: "virtualmachines",
 	}
 
-	// Delete the VirtualMachine
-	err := h.DynamicClient.Resource(vmGVR).Namespace(vm.GetNamespace()).Delete(ctx, vm.GetName(), metav1.DeleteOptions{})
+	// Delete the VirtualMachine (force delete: no grace period, so terminating VMs are removed immediately)
+	err := h.DynamicClient.Resource(vmGVR).Namespace(vm.GetNamespace()).Delete(ctx, vm.GetName(), forceDeleteOptions)
 	if err != nil {
 		fmt.Printf("   [FAIL] ❌ Failed to delete VM %s/%s: %v\n", vm.GetNamespace(), vm.GetName(), err)
 	} else {
@@ -1258,8 +1262,9 @@ func (h *Healer) triggerCRDCleanup(resource *unstructured.Unstructured, gvr sche
 
 // doCRDCleanup runs one attempt of CRD cleanup. Returns (true, nil) when done (success or skip), (false, err) when a retriable error occurred.
 func (h *Healer) doCRDCleanup(ctx context.Context, resource *unstructured.Unstructured, gvr schema.GroupVersionResource, resourceName, resourceNamespace, resourceKey string) (done bool, err error) {
-	// If cleanup finalizers is enabled and resource has finalizers, remove them first
-	if h.CleanupFinalizers && len(resource.GetFinalizers()) > 0 {
+	// Remove finalizers when: cleanup is enabled, or resource is already terminating (force-delete stuck resources)
+	forceFinalizerRemoval := len(resource.GetFinalizers()) > 0 && (h.CleanupFinalizers || resource.GetDeletionTimestamp() != nil)
+	if forceFinalizerRemoval {
 		fmt.Printf("   [INFO] 🔄 Removing finalizers from %s/%s/%s...\n", gvr.Resource, resourceNamespace, resourceName)
 
 		currentResource, getErr := h.DynamicClient.Resource(gvr).Namespace(resourceNamespace).Get(ctx, resourceName, metav1.GetOptions{})
@@ -1314,8 +1319,8 @@ func (h *Healer) doCRDCleanup(ctx context.Context, resource *unstructured.Unstru
 		}
 	}
 
-	// Delete the resource
-	delErr := h.DynamicClient.Resource(gvr).Namespace(resourceNamespace).Delete(ctx, resourceName, metav1.DeleteOptions{})
+	// Delete the resource (force delete: no grace period, so terminating/stale resources are removed immediately)
+	delErr := h.DynamicClient.Resource(gvr).Namespace(resourceNamespace).Delete(ctx, resourceName, forceDeleteOptions)
 	if delErr != nil {
 		if apierrors.IsNotFound(delErr) {
 			fmt.Printf("   [SKIP] ⏭️ Resource %s/%s/%s was already deleted\n", gvr.Resource, resourceNamespace, resourceName)
@@ -1558,13 +1563,13 @@ func (h *Healer) evictPodForOptimization(pod *v1.Pod, strainInfo util.ClusterStr
 			Name:      pod.Name,
 			Namespace: pod.Namespace,
 		},
-		DeleteOptions: &metav1.DeleteOptions{},
+		DeleteOptions: &forceDeleteOptions,
 	})
 
 	if err != nil {
 		fmt.Printf("   [FAIL] ❌ Failed to evict pod %s: %v\n", podKey, err)
 		// Fallback to direct deletion if eviction fails
-		err = h.ClientSet.CoreV1().Pods(pod.Namespace).Delete(ctx, pod.Name, metav1.DeleteOptions{})
+		err = h.ClientSet.CoreV1().Pods(pod.Namespace).Delete(ctx, pod.Name, forceDeleteOptions)
 		if err != nil {
 			fmt.Printf("   [FAIL] ❌ Failed to delete pod %s: %v\n", podKey, err)
 		} else {
@@ -1893,14 +1898,9 @@ func (h *Healer) checkAndDeleteStaleNamespaces(namespaces []v1.Namespace, patter
 
 		// Only check age for namespaces that match the pattern
 		if matchesPattern {
-			// Check if namespace is stuck in Terminating state (regardless of age)
-			if ns.Status.Phase == v1.NamespaceTerminating && ns.DeletionTimestamp != nil {
-				// If it's been terminating for more than 2 minutes, consider it stuck
-				terminatingDuration := now.Sub(ns.DeletionTimestamp.Time)
-				if terminatingDuration > 2*time.Minute {
-					staleNamespaces = append(staleNamespaces, ns)
-					continue
-				}
+			// Ignore namespaces already in Terminating state (let them complete on their own)
+			if ns.Status.Phase == v1.NamespaceTerminating {
+				continue
 			}
 
 			// Check if namespace is older than the stale age threshold
@@ -1942,47 +1942,10 @@ func (h *Healer) triggerNamespaceDeletion(ns *v1.Namespace) {
 	fmt.Printf("    Namespace: %s\n", ns.Name)
 	fmt.Printf("    Age: %v (threshold: %v)\n", nsAge.Round(time.Second), h.StaleAge)
 
-	// Check if namespace is already in Terminating state (might be stuck with finalizers)
+	// Ignore namespaces already in Terminating state (not considered for cleanup)
 	if ns.Status.Phase == v1.NamespaceTerminating {
-		fmt.Printf("   [INFO] 🔍 Namespace %s is already in Terminating state\n", ns.Name)
-
-		// If cleanup finalizers is enabled, try to remove finalizers to unstick it
-		if h.CleanupFinalizers && len(ns.Finalizers) > 0 {
-			fmt.Printf("   [INFO] 🔄 Removing finalizers from namespace %s to unstick deletion...\n", ns.Name)
-
-			// Get the current namespace to update
-			currentNs, err := h.ClientSet.CoreV1().Namespaces().Get(ctx, ns.Name, metav1.GetOptions{})
-			if err != nil {
-				if apierrors.IsNotFound(err) {
-					fmt.Printf("   [SKIP] ⏭️ Namespace %s was already deleted\n", ns.Name)
-					h.removeNamespaceFromTracking(ns.Name)
-					return
-				}
-				fmt.Printf("   [WARN] ⚠️ Failed to get namespace %s for finalizer removal: %v\n", ns.Name, err)
-			} else {
-				// Remove all finalizers
-				currentNs.Finalizers = []string{}
-				_, err = h.ClientSet.CoreV1().Namespaces().Update(ctx, currentNs, metav1.UpdateOptions{})
-				if err != nil {
-					if apierrors.IsNotFound(err) {
-						fmt.Printf("   [SKIP] ⏭️ Namespace %s was deleted during finalizer removal\n", ns.Name)
-						h.removeNamespaceFromTracking(ns.Name)
-						return
-					}
-					fmt.Printf("   [WARN] ⚠️ Failed to remove finalizers from namespace %s: %v\n", ns.Name, err)
-				} else {
-					fmt.Printf("   [SUCCESS] ✅ Removed finalizers from namespace %s\n", ns.Name)
-					// Finalizers removed, namespace should complete deletion now
-					h.removeNamespaceFromTracking(ns.Name)
-					fmt.Printf("!!! NAMESPACE CLEANUP ACTION COMPLETE !!!\n\n")
-					return
-				}
-			}
-		} else {
-			// Namespace is terminating but we can't remove finalizers, just wait
-			fmt.Printf("   [INFO] ⏳ Namespace %s is terminating (finalizers: %v)\n", ns.Name, ns.Finalizers)
-			return
-		}
+		fmt.Printf("   [SKIP] ⏭️ Ignoring namespace %s (already in Terminating state)\n", ns.Name)
+		return
 	}
 
 	// If cleanup finalizers is enabled and namespace has finalizers, remove them first
@@ -2017,8 +1980,8 @@ func (h *Healer) triggerNamespaceDeletion(ns *v1.Namespace) {
 		}
 	}
 
-	// Attempt to delete the namespace
-	err := h.ClientSet.CoreV1().Namespaces().Delete(ctx, ns.Name, metav1.DeleteOptions{})
+	// Attempt to delete the namespace (force delete: no grace period, so terminating namespaces are removed immediately)
+	err := h.ClientSet.CoreV1().Namespaces().Delete(ctx, ns.Name, forceDeleteOptions)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			fmt.Printf("   [SKIP] ⏭️ Namespace %s was already deleted\n", ns.Name)

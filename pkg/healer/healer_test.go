@@ -136,6 +136,18 @@ func TestHealer_IsTestNamespace(t *testing.T) {
 	}
 }
 
+// TestForceDeleteOptions_UseImmediateDeletion ensures all healer deletions use GracePeriodSeconds=0
+// so stale/terminating resources are removed immediately (no grace period).
+func TestForceDeleteOptions_UseImmediateDeletion(t *testing.T) {
+	if forceDeleteOptions.GracePeriodSeconds == nil {
+		t.Fatal("forceDeleteOptions.GracePeriodSeconds should be set for force delete")
+	}
+	if *forceDeleteOptions.GracePeriodSeconds != 0 {
+		t.Errorf("forceDeleteOptions.GracePeriodSeconds = %d, want 0 for immediate deletion of stale/terminating resources",
+			*forceDeleteOptions.GracePeriodSeconds)
+	}
+}
+
 func TestFormatBool(t *testing.T) {
 	tests := []struct {
 		name     string

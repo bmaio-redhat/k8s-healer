@@ -348,6 +348,57 @@ docker build -t k8s-healer .
 podman build -t k8s-healer .
 ```
 
+#### Publishing to Quay.io
+
+The **`test-quay-build.sh`** script simulates a CI pipeline: it builds the image, tags it (by branch and commit SHA or by Git tag), and pushes it to Quay.io. Use it to test the full build-and-push flow locally or to publish images manually.
+
+**Prerequisites:** Podman, and a [Quay.io](https://quay.io) repository. Create a [robot account](https://docs.projectquay.io/glossary/robot-account.html) (or use your user credentials) and grant it push access to the repository.
+
+**Required environment variables:**
+
+| Variable | Description | Example |
+|----------|-------------|---------|
+| `QUAY_REGISTRY` | Registry host | `quay.io` |
+| `QUAY_USERNAME` | Robot or user name | `myorg+robot` or `myuser` |
+| `QUAY_PASSWORD` | Robot or user token/password | (secret) |
+| `QUAY_REPOSITORY` | Repository path | `myorg/k8s-healer` |
+
+**Optional (default from git if unset):**
+
+| Variable | Description |
+|----------|-------------|
+| `CI_COMMIT_BRANCH` | Git branch (default: current branch) |
+| `CI_COMMIT_TAG` | Git tag (if building from a tag) |
+| `CI_COMMIT_SHORT_SHA` | Short commit SHA (default: current commit) |
+| `CI_COMMIT_REF_SLUG` | Branch slug (default: same as branch) |
+
+**Tag behaviour:**
+
+- If `CI_COMMIT_TAG` is set, the image is tagged with that tag (e.g. `v1.0.0`).
+- Otherwise the image is tagged as `branch-SHA` (e.g. `main-abc1234`) and also as `latest` and as the branch name (e.g. `main`).
+
+**Run the script:**
+
+```bash
+# Set required variables (use a robot token for QUAY_PASSWORD)
+export QUAY_REGISTRY=quay.io
+export QUAY_USERNAME=your-org+robot_name
+export QUAY_PASSWORD=your-robot-token
+export QUAY_REPOSITORY=your-org/k8s-healer
+
+# Build and push (uses current branch and commit by default)
+./test-quay-build.sh
+```
+
+To build from a specific tag (e.g. for a release):
+
+```bash
+export CI_COMMIT_TAG=v1.0.0
+./test-quay-build.sh
+```
+
+The script logs in to Quay, builds the image with the project’s `Dockerfile`, tags it, pushes all tags, then logs out. It does **not** run the container; use the [Running the Container](#running-the-container) instructions with the Quay image name (e.g. `quay.io/your-org/k8s-healer:latest`) to run it.
+
 #### Running the Container
 
 **Easy Way (Recommended):** Use the `docker-k8s-healer.sh` wrapper script to automatically handle volume mounting. This allows you to use the same flags as the native binary without manually specifying the `-v` flag. The script automatically prefers Podman and falls back to Docker if Podman is not available:
