@@ -6,7 +6,6 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath" // Used for wildcard matching (Glob/Match)
-	"runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -573,7 +572,6 @@ shutdown:
 }
 
 func main() {
-	runtime.GOMAXPROCS(2)
 	if err := rootCmd.Execute(); err != nil {
 		fmt.Println(err)
 		os.Exit(1)
