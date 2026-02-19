@@ -5,6 +5,13 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/version"
+	openapi_v2 "github.com/google/gnostic-models/openapiv2"
+	"k8s.io/client-go/discovery"
+	"k8s.io/client-go/openapi"
+	"k8s.io/client-go/rest"
 )
 
 func TestDiscoverClusterEndpoints_InvalidKubeconfig(t *testing.T) {
@@ -178,4 +185,83 @@ func TestDiscoverClusterEndpoints_OutputFormat(t *testing.T) {
 	// This test passes if it doesn't panic
 	// Full output validation requires integration testing with a real cluster
 	t.Log("Output format test passed - full validation requires real cluster connection")
+}
+
+// mockDiscoveryClient implements discovery.DiscoveryInterface for tests with fixed ServerGroups and ServerResourcesForGroupVersion.
+type mockDiscoveryClient struct {
+	groups    *metav1.APIGroupList
+	resources map[string]*metav1.APIResourceList
+	version   *version.Info
+}
+
+func (m *mockDiscoveryClient) ServerVersion() (*version.Info, error) {
+	if m.version != nil {
+		return m.version, nil
+	}
+	return &version.Info{GitVersion: "v1.28.0", Platform: "linux/amd64", GoVersion: "go1.21"}, nil
+}
+
+func (m *mockDiscoveryClient) ServerGroups() (*metav1.APIGroupList, error) {
+	return m.groups, nil
+}
+
+func (m *mockDiscoveryClient) ServerResourcesForGroupVersion(groupVersion string) (*metav1.APIResourceList, error) {
+	if m.resources != nil {
+		if r, ok := m.resources[groupVersion]; ok {
+			return r, nil
+		}
+	}
+	return &metav1.APIResourceList{GroupVersion: groupVersion, APIResources: []metav1.APIResource{}}, nil
+}
+
+func (m *mockDiscoveryClient) RESTClient() rest.Interface                 { return nil }
+func (m *mockDiscoveryClient) WithLegacy() discovery.DiscoveryInterface    { return m }
+func (m *mockDiscoveryClient) OpenAPISchema() (*openapi_v2.Document, error) { return nil, nil }
+func (m *mockDiscoveryClient) OpenAPIV3() openapi.Client                  { return nil }
+func (m *mockDiscoveryClient) ServerPreferredResources() ([]*metav1.APIResourceList, error) {
+	return nil, nil
+}
+func (m *mockDiscoveryClient) ServerPreferredNamespacedResources() ([]*metav1.APIResourceList, error) {
+	return nil, nil
+}
+func (m *mockDiscoveryClient) ServerResources() ([]*metav1.APIResourceList, error) {
+	return nil, nil
+}
+func (m *mockDiscoveryClient) ServerGroupsAndResources() ([]*metav1.APIGroup, []*metav1.APIResourceList, error) {
+	return nil, nil, nil
+}
+
+// TestDiscoverClusterEndpointsWithClient_MockDiscovery runs the discovery logic with a mock to cover code paths.
+func TestDiscoverClusterEndpointsWithClient_MockDiscovery(t *testing.T) {
+	groups := &metav1.APIGroupList{
+		Groups: []metav1.APIGroup{
+			{
+				Name:     "",
+				Versions: []metav1.GroupVersionForDiscovery{{GroupVersion: "v1", Version: "v1"}},
+				PreferredVersion: metav1.GroupVersionForDiscovery{GroupVersion: "v1", Version: "v1"},
+			},
+			{
+				Name:     "kubevirt.io",
+				Versions: []metav1.GroupVersionForDiscovery{{GroupVersion: "kubevirt.io/v1", Version: "v1"}},
+				PreferredVersion: metav1.GroupVersionForDiscovery{GroupVersion: "kubevirt.io/v1", Version: "v1"},
+			},
+		},
+	}
+	resources := map[string]*metav1.APIResourceList{
+		"v1": {
+			GroupVersion: "v1",
+			APIResources: []metav1.APIResource{{Name: "pods", Namespaced: true, Kind: "Pod", Verbs: []string{"get", "list"}}},
+		},
+		"kubevirt.io/v1": {
+			GroupVersion: "kubevirt.io/v1",
+			APIResources: []metav1.APIResource{{Name: "virtualmachines", Namespaced: true, Kind: "VirtualMachine", Verbs: []string{"get", "list"}}},
+		},
+	}
+	mock := &mockDiscoveryClient{groups: groups, resources: resources}
+	config := &rest.Config{Host: "https://test.example.com"}
+
+	err := DiscoverClusterEndpointsWithClient(config, mock)
+	if err != nil {
+		t.Fatalf("DiscoverClusterEndpointsWithClient() with mock: %v", err)
+	}
 }

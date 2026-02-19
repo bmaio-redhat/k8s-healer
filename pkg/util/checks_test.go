@@ -1,6 +1,7 @@
 package util
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -259,6 +260,81 @@ func TestIsNodeUnhealthy(t *testing.T) {
 			result := IsNodeUnhealthy(tt.node)
 			if result != tt.expected {
 				t.Errorf("IsNodeUnhealthy() = %v, want %v", result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestGetNodeHealReason(t *testing.T) {
+	now := time.Now()
+	tests := []struct {
+		name     string
+		node     *v1.Node
+		contains string
+	}{
+		{
+			name: "NotReady node",
+			node: &v1.Node{
+				ObjectMeta: metav1.ObjectMeta{Name: "notready-node"},
+				Status: v1.NodeStatus{
+					Conditions: []v1.NodeCondition{
+						{
+							Type:               v1.NodeReady,
+							Status:             v1.ConditionFalse,
+							LastTransitionTime: metav1.Time{Time: now.Add(-6 * time.Minute)},
+						},
+					},
+				},
+			},
+			contains: "NotReady",
+		},
+		{
+			name: "Unknown node",
+			node: &v1.Node{
+				ObjectMeta: metav1.ObjectMeta{Name: "unknown-node"},
+				Status: v1.NodeStatus{
+					Conditions: []v1.NodeCondition{
+						{
+							Type:               v1.NodeReady,
+							Status:             v1.ConditionUnknown,
+							LastTransitionTime: metav1.Time{Time: now.Add(-3 * time.Minute)},
+						},
+					},
+				},
+			},
+			contains: "Unknown",
+		},
+		{
+			name: "node with memory pressure",
+			node: &v1.Node{
+				ObjectMeta: metav1.ObjectMeta{Name: "pressure-node"},
+				Status: v1.NodeStatus{
+					Conditions: []v1.NodeCondition{
+						{Type: v1.NodeReady, Status: v1.ConditionTrue, LastTransitionTime: metav1.Time{Time: now.Add(-1 * time.Hour)}},
+						{Type: v1.NodeMemoryPressure, Status: v1.ConditionTrue, LastTransitionTime: metav1.Time{Time: now.Add(-15 * time.Minute)}},
+					},
+				},
+			},
+			contains: "resource pressure",
+		},
+		{
+			name: "healthy node",
+			node: &v1.Node{
+				ObjectMeta: metav1.ObjectMeta{Name: "healthy-node"},
+				Status: v1.NodeStatus{
+					Conditions: []v1.NodeCondition{
+						{Type: v1.NodeReady, Status: v1.ConditionTrue, LastTransitionTime: metav1.Time{Time: now}},
+					},
+				},
+			},
+			contains: "Unspecified",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			reason := GetNodeHealReason(tt.node)
+			if !strings.Contains(reason, tt.contains) {
+				t.Errorf("GetNodeHealReason() = %q, want to contain %q", reason, tt.contains)
 			}
 		})
 	}

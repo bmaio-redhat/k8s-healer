@@ -59,8 +59,9 @@ func TestHealer_DoCRDCleanup_ResourceNotFound(t *testing.T) {
 			"apiVersion": "kubevirt.io/v1",
 			"kind":       "VirtualMachine",
 			"metadata": map[string]interface{}{
-				"name":      "nonexistent-vm",
-				"namespace": "default",
+				"name":       "nonexistent-vm",
+				"namespace":  "default",
+				"finalizers": []interface{}{"test"},
 			},
 		},
 	}
@@ -142,6 +143,54 @@ func TestHealer_DoCRDCleanup_Success(t *testing.T) {
 	healer.crdCleanupCountsMu.RUnlock()
 	if count != 1 {
 		t.Errorf("CRDCleanupCounts[virtualmachines.kubevirt.io/v1] = %d, want 1", count)
+	}
+}
+
+func TestHealer_DoCRDCleanup_WithFinalizers(t *testing.T) {
+	healer, err := createTestHealer([]string{"default"})
+	if err != nil {
+		t.Fatalf("createTestHealer() error = %v", err)
+	}
+
+	scheme := runtime.NewScheme()
+	gvr := schema.GroupVersionResource{Group: "kubevirt.io", Version: "v1", Resource: "virtualmachines"}
+	dynamicClient := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(scheme, map[schema.GroupVersionResource]string{gvr: "VirtualMachineList"})
+	healer.DynamicClient = dynamicClient
+	healer.CleanupFinalizers = true
+
+	vm := &unstructured.Unstructured{
+		Object: map[string]interface{}{
+			"apiVersion": "kubevirt.io/v1",
+			"kind":       "VirtualMachine",
+			"metadata": map[string]interface{}{
+				"name":       "vm-with-finalizers",
+				"namespace":  "default",
+				"finalizers": []interface{}{"test-finalizer"},
+			},
+		},
+	}
+	_, err = dynamicClient.Resource(gvr).Namespace("default").Create(context.TODO(), vm, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("Create VM: %v", err)
+	}
+
+	resourceKey := "virtualmachines/default/vm-with-finalizers"
+	healer.trackedCRDsMu.Lock()
+	healer.TrackedCRDs[resourceKey] = true
+	healer.trackedCRDsMu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	done, err := healer.doCRDCleanup(ctx, vm, gvr, "vm-with-finalizers", "default", resourceKey)
+	if err != nil {
+		t.Errorf("doCRDCleanup() err = %v", err)
+	}
+	if !done {
+		t.Error("doCRDCleanup() done = false, want true")
+	}
+	_, getErr := dynamicClient.Resource(gvr).Namespace("default").Get(ctx, "vm-with-finalizers", metav1.GetOptions{})
+	if !apierrors.IsNotFound(getErr) {
+		t.Errorf("Resource should be deleted after finalizer removal; Get err = %v", getErr)
 	}
 }
 

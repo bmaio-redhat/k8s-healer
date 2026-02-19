@@ -2,17 +2,24 @@ package healthcheck
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
 	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/dynamic"
 	dynamicfake "k8s.io/client-go/dynamic/fake"
 	"k8s.io/client-go/kubernetes"
 	kubernetesfake "k8s.io/client-go/kubernetes/fake"
 	"k8s.io/client-go/rest"
+	k8stesting "k8s.io/client-go/testing"
 )
 
 // createTestClients creates fake Kubernetes clients for testing
@@ -67,29 +74,24 @@ func TestCheckKubernetesAPI(t *testing.T) {
 }
 
 func TestCheckKubernetesAPI_Error(t *testing.T) {
-	// Note: Fake clients don't respect context cancellation the same way real clients do
-	// This test verifies the function handles errors, but with fake clients it may still succeed
-	// In a real scenario with network issues, the real client would fail appropriately
 	clientset := kubernetesfake.NewSimpleClientset()
+	clientset.Fake.PrependReactor("list", "namespaces", func(action k8stesting.Action) (handled bool, ret runtime.Object, err error) {
+		return true, nil, fmt.Errorf("connection refused")
+	})
 
-	// Use a context with a very short timeout to potentially trigger timeout
-	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Nanosecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-
-	// Give it a moment for timeout
-	time.Sleep(10 * time.Millisecond)
 
 	result := checkKubernetesAPI(ctx, clientset)
 
-	// With fake clients, the operation may still succeed even with cancelled context
-	// The important thing is that the function doesn't panic and returns a valid result
-	if result.Status == "unknown" {
-		t.Error("checkKubernetesAPI() result status should not be unknown")
+	if result.Status != "unhealthy" {
+		t.Errorf("checkKubernetesAPI() status = %v, want unhealthy", result.Status)
 	}
-
-	// Verify the result structure is valid
-	if result.Name == "" {
-		t.Error("checkKubernetesAPI() result should have a name")
+	if result.Error == nil {
+		t.Error("checkKubernetesAPI() error = nil, want non-nil")
+	}
+	if result.Message == "" {
+		t.Error("checkKubernetesAPI() message should not be empty")
 	}
 }
 
@@ -120,6 +122,214 @@ func TestCheckKubeVirtCRDs(t *testing.T) {
 
 		if result.Duration == 0 {
 			t.Errorf("checkKubeVirtCRDs() duration should be > 0 for %s", result.Name)
+		}
+	}
+}
+
+// notFoundDynamicClient is a dynamic.Interface that returns NotFound for all List calls (used to test error branches).
+type notFoundDynamicClient struct{}
+
+func (c *notFoundDynamicClient) Resource(gvr schema.GroupVersionResource) dynamic.NamespaceableResourceInterface {
+	return &notFoundResourceInterface{gvr: gvr}
+}
+
+type notFoundResourceInterface struct {
+	gvr schema.GroupVersionResource
+}
+
+func (r *notFoundResourceInterface) Namespace(string) dynamic.ResourceInterface { return r }
+
+func (r *notFoundResourceInterface) List(ctx context.Context, opts metav1.ListOptions) (*unstructured.UnstructuredList, error) {
+	return nil, errors.NewNotFound(schema.GroupResource{Group: r.gvr.Group, Resource: r.gvr.Resource}, "")
+}
+
+func (r *notFoundResourceInterface) Get(ctx context.Context, name string, opts metav1.GetOptions, subresources ...string) (*unstructured.Unstructured, error) {
+	return nil, errors.NewNotFound(schema.GroupResource{Group: r.gvr.Group, Resource: r.gvr.Resource}, name)
+}
+
+func (r *notFoundResourceInterface) Create(ctx context.Context, obj *unstructured.Unstructured, options metav1.CreateOptions, subresources ...string) (*unstructured.Unstructured, error) {
+	return nil, errors.NewNotFound(schema.GroupResource{Group: r.gvr.Group, Resource: r.gvr.Resource}, "")
+}
+
+func (r *notFoundResourceInterface) Update(ctx context.Context, obj *unstructured.Unstructured, options metav1.UpdateOptions, subresources ...string) (*unstructured.Unstructured, error) {
+	return nil, errors.NewNotFound(schema.GroupResource{Group: r.gvr.Group, Resource: r.gvr.Resource}, "")
+}
+
+func (r *notFoundResourceInterface) UpdateStatus(ctx context.Context, obj *unstructured.Unstructured, options metav1.UpdateOptions) (*unstructured.Unstructured, error) {
+	return nil, errors.NewNotFound(schema.GroupResource{Group: r.gvr.Group, Resource: r.gvr.Resource}, "")
+}
+
+func (r *notFoundResourceInterface) Delete(ctx context.Context, name string, options metav1.DeleteOptions, subresources ...string) error {
+	return errors.NewNotFound(schema.GroupResource{Group: r.gvr.Group, Resource: r.gvr.Resource}, name)
+}
+
+func (r *notFoundResourceInterface) DeleteCollection(ctx context.Context, options metav1.DeleteOptions, listOptions metav1.ListOptions) error {
+	return errors.NewNotFound(schema.GroupResource{Group: r.gvr.Group, Resource: r.gvr.Resource}, "")
+}
+
+func (r *notFoundResourceInterface) Watch(ctx context.Context, opts metav1.ListOptions) (watch.Interface, error) {
+	return nil, errors.NewNotFound(schema.GroupResource{Group: r.gvr.Group, Resource: r.gvr.Resource}, "")
+}
+
+func (r *notFoundResourceInterface) Patch(ctx context.Context, name string, pt types.PatchType, data []byte, options metav1.PatchOptions, subresources ...string) (*unstructured.Unstructured, error) {
+	return nil, errors.NewNotFound(schema.GroupResource{Group: r.gvr.Group, Resource: r.gvr.Resource}, name)
+}
+
+func (r *notFoundResourceInterface) Apply(ctx context.Context, name string, obj *unstructured.Unstructured, options metav1.ApplyOptions, subresources ...string) (*unstructured.Unstructured, error) {
+	return nil, errors.NewNotFound(schema.GroupResource{Group: r.gvr.Group, Resource: r.gvr.Resource}, name)
+}
+
+func (r *notFoundResourceInterface) ApplyStatus(ctx context.Context, name string, obj *unstructured.Unstructured, options metav1.ApplyOptions) (*unstructured.Unstructured, error) {
+	return nil, errors.NewNotFound(schema.GroupResource{Group: r.gvr.Group, Resource: r.gvr.Resource}, name)
+}
+
+func TestCheckKubeVirtCRDs_NotFound(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	results := checkKubeVirtCRDs(ctx, &notFoundDynamicClient{})
+
+	if len(results) != len(kubevirtCRDs) {
+		t.Errorf("checkKubeVirtCRDs() returned %d results, want %d", len(results), len(kubevirtCRDs))
+	}
+	for _, result := range results {
+		if result.Status != "unhealthy" {
+			t.Errorf("checkKubeVirtCRDs() with NotFound client: result for %s status = %v, want unhealthy", result.Name, result.Status)
+		}
+		if !errors.IsNotFound(result.Error) {
+			t.Errorf("checkKubeVirtCRDs() with NotFound client: result for %s error = %v, want NotFound", result.Name, result.Error)
+		}
+	}
+}
+
+// forbiddenDynamicClient returns Forbidden for List (used to test IsForbidden branch).
+type forbiddenDynamicClient struct{}
+
+func (c *forbiddenDynamicClient) Resource(gvr schema.GroupVersionResource) dynamic.NamespaceableResourceInterface {
+	return &forbiddenResourceInterface{gvr: gvr}
+}
+
+type forbiddenResourceInterface struct {
+	gvr schema.GroupVersionResource
+}
+
+func (r *forbiddenResourceInterface) Namespace(string) dynamic.ResourceInterface { return r }
+
+func (r *forbiddenResourceInterface) List(ctx context.Context, opts metav1.ListOptions) (*unstructured.UnstructuredList, error) {
+	return nil, errors.NewForbidden(schema.GroupResource{Group: r.gvr.Group, Resource: r.gvr.Resource}, "", fmt.Errorf("RBAC"))
+}
+
+func (r *forbiddenResourceInterface) Get(ctx context.Context, name string, opts metav1.GetOptions, subresources ...string) (*unstructured.Unstructured, error) {
+	return nil, errors.NewForbidden(schema.GroupResource{Group: r.gvr.Group, Resource: r.gvr.Resource}, name, nil)
+}
+func (r *forbiddenResourceInterface) Create(ctx context.Context, obj *unstructured.Unstructured, options metav1.CreateOptions, subresources ...string) (*unstructured.Unstructured, error) {
+	return nil, errors.NewForbidden(schema.GroupResource{Group: r.gvr.Group, Resource: r.gvr.Resource}, "", nil)
+}
+func (r *forbiddenResourceInterface) Update(ctx context.Context, obj *unstructured.Unstructured, options metav1.UpdateOptions, subresources ...string) (*unstructured.Unstructured, error) {
+	return nil, errors.NewForbidden(schema.GroupResource{Group: r.gvr.Group, Resource: r.gvr.Resource}, "", nil)
+}
+func (r *forbiddenResourceInterface) UpdateStatus(ctx context.Context, obj *unstructured.Unstructured, options metav1.UpdateOptions) (*unstructured.Unstructured, error) {
+	return nil, errors.NewForbidden(schema.GroupResource{Group: r.gvr.Group, Resource: r.gvr.Resource}, "", nil)
+}
+func (r *forbiddenResourceInterface) Delete(ctx context.Context, name string, options metav1.DeleteOptions, subresources ...string) error {
+	return errors.NewForbidden(schema.GroupResource{Group: r.gvr.Group, Resource: r.gvr.Resource}, name, nil)
+}
+func (r *forbiddenResourceInterface) DeleteCollection(ctx context.Context, options metav1.DeleteOptions, listOptions metav1.ListOptions) error {
+	return errors.NewForbidden(schema.GroupResource{Group: r.gvr.Group, Resource: r.gvr.Resource}, "", nil)
+}
+func (r *forbiddenResourceInterface) Watch(ctx context.Context, opts metav1.ListOptions) (watch.Interface, error) {
+	return nil, errors.NewForbidden(schema.GroupResource{Group: r.gvr.Group, Resource: r.gvr.Resource}, "", nil)
+}
+func (r *forbiddenResourceInterface) Patch(ctx context.Context, name string, pt types.PatchType, data []byte, options metav1.PatchOptions, subresources ...string) (*unstructured.Unstructured, error) {
+	return nil, errors.NewForbidden(schema.GroupResource{Group: r.gvr.Group, Resource: r.gvr.Resource}, name, nil)
+}
+func (r *forbiddenResourceInterface) Apply(ctx context.Context, name string, obj *unstructured.Unstructured, options metav1.ApplyOptions, subresources ...string) (*unstructured.Unstructured, error) {
+	return nil, errors.NewForbidden(schema.GroupResource{Group: r.gvr.Group, Resource: r.gvr.Resource}, name, nil)
+}
+func (r *forbiddenResourceInterface) ApplyStatus(ctx context.Context, name string, obj *unstructured.Unstructured, options metav1.ApplyOptions) (*unstructured.Unstructured, error) {
+	return nil, errors.NewForbidden(schema.GroupResource{Group: r.gvr.Group, Resource: r.gvr.Resource}, name, nil)
+}
+
+func TestCheckKubeVirtCRDs_Forbidden(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	results := checkKubeVirtCRDs(ctx, &forbiddenDynamicClient{})
+
+	if len(results) != len(kubevirtCRDs) {
+		t.Errorf("checkKubeVirtCRDs() returned %d results, want %d", len(results), len(kubevirtCRDs))
+	}
+	for _, result := range results {
+		if result.Status != "degraded" {
+			t.Errorf("checkKubeVirtCRDs() with Forbidden client: result for %s status = %v, want degraded", result.Name, result.Status)
+		}
+		if !errors.IsForbidden(result.Error) {
+			t.Errorf("checkKubeVirtCRDs() with Forbidden client: result for %s error = %v, want Forbidden", result.Name, result.Error)
+		}
+	}
+}
+
+// genericErrorDynamicClient returns a non-NotFound/Forbidden error for List (covers "else" branch).
+type genericErrorDynamicClient struct{}
+
+func (c *genericErrorDynamicClient) Resource(gvr schema.GroupVersionResource) dynamic.NamespaceableResourceInterface {
+	return &genericErrorResourceInterface{}
+}
+
+type genericErrorResourceInterface struct{}
+
+func (r *genericErrorResourceInterface) Namespace(string) dynamic.ResourceInterface { return r }
+
+func (r *genericErrorResourceInterface) List(ctx context.Context, opts metav1.ListOptions) (*unstructured.UnstructuredList, error) {
+	return nil, fmt.Errorf("server unavailable")
+}
+
+func (r *genericErrorResourceInterface) Get(ctx context.Context, name string, opts metav1.GetOptions, subresources ...string) (*unstructured.Unstructured, error) {
+	return nil, fmt.Errorf("server unavailable")
+}
+func (r *genericErrorResourceInterface) Create(ctx context.Context, obj *unstructured.Unstructured, options metav1.CreateOptions, subresources ...string) (*unstructured.Unstructured, error) {
+	return nil, fmt.Errorf("server unavailable")
+}
+func (r *genericErrorResourceInterface) Update(ctx context.Context, obj *unstructured.Unstructured, options metav1.UpdateOptions, subresources ...string) (*unstructured.Unstructured, error) {
+	return nil, fmt.Errorf("server unavailable")
+}
+func (r *genericErrorResourceInterface) UpdateStatus(ctx context.Context, obj *unstructured.Unstructured, options metav1.UpdateOptions) (*unstructured.Unstructured, error) {
+	return nil, fmt.Errorf("server unavailable")
+}
+func (r *genericErrorResourceInterface) Delete(ctx context.Context, name string, options metav1.DeleteOptions, subresources ...string) error {
+	return fmt.Errorf("server unavailable")
+}
+func (r *genericErrorResourceInterface) DeleteCollection(ctx context.Context, options metav1.DeleteOptions, listOptions metav1.ListOptions) error {
+	return fmt.Errorf("server unavailable")
+}
+func (r *genericErrorResourceInterface) Watch(ctx context.Context, opts metav1.ListOptions) (watch.Interface, error) {
+	return nil, fmt.Errorf("server unavailable")
+}
+func (r *genericErrorResourceInterface) Patch(ctx context.Context, name string, pt types.PatchType, data []byte, options metav1.PatchOptions, subresources ...string) (*unstructured.Unstructured, error) {
+	return nil, fmt.Errorf("server unavailable")
+}
+func (r *genericErrorResourceInterface) Apply(ctx context.Context, name string, obj *unstructured.Unstructured, options metav1.ApplyOptions, subresources ...string) (*unstructured.Unstructured, error) {
+	return nil, fmt.Errorf("server unavailable")
+}
+func (r *genericErrorResourceInterface) ApplyStatus(ctx context.Context, name string, obj *unstructured.Unstructured, options metav1.ApplyOptions) (*unstructured.Unstructured, error) {
+	return nil, fmt.Errorf("server unavailable")
+}
+
+func TestCheckKubeVirtCRDs_GenericError(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	results := checkKubeVirtCRDs(ctx, &genericErrorDynamicClient{})
+
+	if len(results) != len(kubevirtCRDs) {
+		t.Errorf("checkKubeVirtCRDs() returned %d results, want %d", len(results), len(kubevirtCRDs))
+	}
+	for _, result := range results {
+		if result.Status != "degraded" {
+			t.Errorf("checkKubeVirtCRDs() with generic error client: result for %s status = %v, want degraded", result.Name, result.Status)
+		}
+		if result.Error == nil {
+			t.Errorf("checkKubeVirtCRDs() with generic error client: result for %s error = nil, want non-nil", result.Name)
 		}
 	}
 }
@@ -249,4 +459,55 @@ func testContainsHelper(s, substr string) bool {
 		}
 	}
 	return false
+}
+
+func TestContains(t *testing.T) {
+	tests := []struct {
+		s      string
+		substr string
+		want   bool
+	}{
+		{"", "", true},
+		{"a", "a", true},
+		{"ab", "a", true},
+		{"ab", "b", true},
+		{"abc", "ab", true},
+		{"abc", "bc", true},
+		{"register resource", "register resource", true},
+		{"foo register resource bar", "register resource", true},
+		{"", "x", false},
+		{"a", "ab", false},
+		{"ab", "c", false},
+	}
+	for _, tt := range tests {
+		got := contains(tt.s, tt.substr)
+		if got != tt.want {
+			t.Errorf("contains(%q, %q) = %v, want %v", tt.s, tt.substr, got, tt.want)
+		}
+	}
+}
+
+func TestContainsHelper(t *testing.T) {
+	tests := []struct {
+		s      string
+		substr string
+		want   bool
+	}{
+		{"abc", "ab", true},
+		{"abc", "bc", true},
+		{"abc", "abc", true},
+		{"xabcy", "abc", true},
+		{"abc", "x", false},
+		{"abc", "abcd", false},
+	}
+	for _, tt := range tests {
+		// containsHelper is only called when len(s) > len(substr); for equal length contains uses s == substr
+		if len(tt.s) <= len(tt.substr) {
+			continue
+		}
+		got := containsHelper(tt.s, tt.substr)
+		if got != tt.want {
+			t.Errorf("containsHelper(%q, %q) = %v, want %v", tt.s, tt.substr, got, tt.want)
+		}
+	}
 }

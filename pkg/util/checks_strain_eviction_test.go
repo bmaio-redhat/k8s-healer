@@ -1,6 +1,7 @@
 package util
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -384,6 +385,79 @@ func TestShouldEvictPodForResourceOptimization(t *testing.T) {
 			result := ShouldEvictPodForResourceOptimization(tt.pod, tt.clusterStrain)
 			if result != tt.expected {
 				t.Errorf("ShouldEvictPodForResourceOptimization() = %v, want %v", result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestGetPodEvictionReason(t *testing.T) {
+	now := time.Now()
+	tests := []struct {
+		name           string
+		pod            *v1.Pod
+		clusterStrain  ClusterStrainInfo
+		contains       string
+	}{
+		{
+			name: "OOMKilled pod",
+			pod: &v1.Pod{
+				ObjectMeta: metav1.ObjectMeta{Name: "oom-pod", Namespace: "default"},
+				Status: v1.PodStatus{
+					ContainerStatuses: []v1.ContainerStatus{
+						{
+							Name:         "container",
+							RestartCount: 1,
+							LastTerminationState: v1.ContainerState{
+								Terminated: &v1.ContainerStateTerminated{Reason: "OOMKilled"},
+							},
+						},
+					},
+				},
+			},
+			clusterStrain: ClusterStrainInfo{HasStrain: true, StrainPercentage: 40.0},
+			contains:      "OOMKilled",
+		},
+		{
+			name: "high restart count",
+			pod: &v1.Pod{
+				ObjectMeta: metav1.ObjectMeta{Name: "restart-pod", Namespace: "default"},
+				Status: v1.PodStatus{
+					ContainerStatuses: []v1.ContainerStatus{
+						{Name: "container", RestartCount: 6},
+					},
+				},
+			},
+			clusterStrain: ClusterStrainInfo{HasStrain: true, StrainPercentage: 35.0},
+			contains:      "restart count",
+		},
+		{
+			name: "pending pod",
+			pod: &v1.Pod{
+				ObjectMeta: metav1.ObjectMeta{Name: "pending-pod", Namespace: "default", CreationTimestamp: metav1.Time{Time: now.Add(-10 * time.Minute)}},
+				Status:     v1.PodStatus{Phase: v1.PodPending},
+			},
+			clusterStrain: ClusterStrainInfo{HasStrain: true, StrainPercentage: 50.0},
+			contains:      "Pending",
+		},
+		{
+			name: "generic resource optimization",
+			pod: &v1.Pod{
+				ObjectMeta: metav1.ObjectMeta{Name: "pod", Namespace: "default"},
+				Status: v1.PodStatus{
+					ContainerStatuses: []v1.ContainerStatus{
+						{Name: "container", RestartCount: 2},
+					},
+				},
+			},
+			clusterStrain: ClusterStrainInfo{HasStrain: true, StrainPercentage: 45.0},
+			contains:      "Resource optimization",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			reason := GetPodEvictionReason(tt.pod, tt.clusterStrain)
+			if !strings.Contains(reason, tt.contains) {
+				t.Errorf("GetPodEvictionReason() = %q, want to contain %q", reason, tt.contains)
 			}
 		})
 	}

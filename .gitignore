@@ -42,3 +42,6 @@ Kubernetes config directories
 .kubeconfig/
 .kubeconfigs/
 kubeconfigs/
+.pids/ 
+
+.cursor/

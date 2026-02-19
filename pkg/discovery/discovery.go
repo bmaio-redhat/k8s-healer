@@ -40,7 +40,12 @@ func DiscoverClusterEndpoints(kubeconfigPath string) error {
 	// Create discovery client
 	// kubernetes.NewForConfig returns *kubernetes.Clientset, so we can access RESTClient() directly
 	discoveryClient := discovery.NewDiscoveryClient(clientset.RESTClient())
+	return DiscoverClusterEndpointsWithClient(config, discoveryClient)
+}
 
+// DiscoverClusterEndpointsWithClient runs discovery logic with the given config and discovery client.
+// It is used by DiscoverClusterEndpoints and by tests with a fake discovery client.
+func DiscoverClusterEndpointsWithClient(config *rest.Config, discoveryClient discovery.DiscoveryInterface) error {
 	fmt.Println(strings.Repeat("=", 80))
 	fmt.Println("🔍 Kubernetes Cluster Endpoint Discovery")
 	fmt.Println(strings.Repeat("=", 80))
