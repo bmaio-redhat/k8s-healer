@@ -1,8 +1,12 @@
 package healer
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"io"
+	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -132,4 +136,155 @@ func TestHealer_DoCRDCleanup_Success(t *testing.T) {
 	if !apierrors.IsNotFound(getErr) {
 		t.Errorf("Resource should be deleted; Get err = %v", getErr)
 	}
+	// Successful delete should have recorded cleanup count
+	healer.crdCleanupCountsMu.RLock()
+	count := healer.CRDCleanupCounts["virtualmachines.kubevirt.io/v1"]
+	healer.crdCleanupCountsMu.RUnlock()
+	if count != 1 {
+		t.Errorf("CRDCleanupCounts[virtualmachines.kubevirt.io/v1] = %d, want 1", count)
+	}
+}
+
+func TestHealer_RecordCRDCleanup(t *testing.T) {
+	healer, err := createTestHealer([]string{"default"})
+	if err != nil {
+		t.Fatalf("createTestHealer() error = %v", err)
+	}
+
+	gvr1 := schema.GroupVersionResource{Group: "kubevirt.io", Version: "v1", Resource: "virtualmachines"}
+	gvr2 := schema.GroupVersionResource{Group: "cdi.kubevirt.io", Version: "v1beta1", Resource: "datavolumes"}
+
+	healer.RecordCRDCleanup(gvr1)
+	healer.RecordCRDCleanup(gvr1)
+	healer.RecordCRDCleanup(gvr2)
+
+	healer.crdCleanupCountsMu.RLock()
+	defer healer.crdCleanupCountsMu.RUnlock()
+	if got := healer.CRDCleanupCounts["virtualmachines.kubevirt.io/v1"]; got != 2 {
+		t.Errorf("CRDCleanupCounts[virtualmachines.kubevirt.io/v1] = %d, want 2", got)
+	}
+	if got := healer.CRDCleanupCounts["datavolumes.cdi.kubevirt.io/v1beta1"]; got != 1 {
+		t.Errorf("CRDCleanupCounts[datavolumes.cdi.kubevirt.io/v1beta1] = %d, want 1", got)
+	}
+}
+
+func TestHealer_RecordCRDCleanup_NilMap(t *testing.T) {
+	healer, err := createTestHealer([]string{"default"})
+	if err != nil {
+		t.Fatalf("createTestHealer() error = %v", err)
+	}
+	healer.CRDCleanupCounts = nil
+
+	healer.RecordCRDCleanup(schema.GroupVersionResource{Group: "kubevirt.io", Version: "v1", Resource: "virtualmachines"})
+
+	healer.crdCleanupCountsMu.RLock()
+	defer healer.crdCleanupCountsMu.RUnlock()
+	if healer.CRDCleanupCounts == nil {
+		t.Fatal("RecordCRDCleanup should initialize CRDCleanupCounts when nil")
+	}
+	if got := healer.CRDCleanupCounts["virtualmachines.kubevirt.io/v1"]; got != 1 {
+		t.Errorf("CRDCleanupCounts[virtualmachines.kubevirt.io/v1] = %d, want 1", got)
+	}
+}
+
+func TestHealer_PrintCRDCleanupSummary(t *testing.T) {
+	healer, err := createTestHealer([]string{"default"})
+	if err != nil {
+		t.Fatalf("createTestHealer() error = %v", err)
+	}
+
+	// Empty summary
+	old := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("Pipe: %v", err)
+	}
+	os.Stdout = w
+	healer.PrintCRDCleanupSummary()
+	w.Close()
+	var buf bytes.Buffer
+	io.Copy(&buf, r)
+	os.Stdout = old
+	out := buf.String()
+	if !strings.Contains(out, "0 resources cleaned") {
+		t.Errorf("PrintCRDCleanupSummary() empty output should mention no cleanups; got %q", out)
+	}
+
+	// Non-empty summary
+	healer.crdCleanupCountsMu.Lock()
+	healer.CRDCleanupCounts["virtualmachines.kubevirt.io/v1"] = 3
+	healer.CRDCleanupCounts["datavolumes.cdi.kubevirt.io/v1beta1"] = 2
+	healer.crdCleanupCountsMu.Unlock()
+
+	r2, w2, _ := os.Pipe()
+	os.Stdout = w2
+	healer.PrintCRDCleanupSummary()
+	w2.Close()
+	var buf2 bytes.Buffer
+	io.Copy(&buf2, r2)
+	os.Stdout = old
+	out2 := buf2.String()
+	if !strings.Contains(out2, "virtualmachines.kubevirt.io/v1: 3") {
+		t.Errorf("PrintCRDCleanupSummary() should list virtualmachines count; got %q", out2)
+	}
+	if !strings.Contains(out2, "datavolumes.cdi.kubevirt.io/v1beta1: 2") {
+		t.Errorf("PrintCRDCleanupSummary() should list datavolumes count; got %q", out2)
+	}
+	if !strings.Contains(out2, "Total: 5 resources cleaned") {
+		t.Errorf("PrintCRDCleanupSummary() should show total 5; got %q", out2)
+	}
+}
+
+func TestHealer_RunFullCRDCleanup_Disabled(t *testing.T) {
+	healer, err := createTestHealer([]string{"default"})
+	if err != nil {
+		t.Fatalf("createTestHealer() error = %v", err)
+	}
+	healer.EnableCRDCleanup = false
+
+	old := os.Stdout
+	r, w, _ := os.Pipe()
+	os.Stdout = w
+	healer.RunFullCRDCleanup()
+	w.Close()
+	var buf bytes.Buffer
+	io.Copy(&buf, r)
+	os.Stdout = old
+
+	if !strings.Contains(buf.String(), "CRD cleanup is disabled") {
+		t.Errorf("RunFullCRDCleanup() when disabled should print message; got %q", buf.String())
+	}
+}
+
+func TestHealer_RunFullCRDCleanup_NoResources(t *testing.T) {
+	healer, err := createTestHealer([]string{"default"})
+	if err != nil {
+		t.Fatalf("createTestHealer() error = %v", err)
+	}
+	healer.CRDResources = nil
+
+	old := os.Stdout
+	r, w, _ := os.Pipe()
+	os.Stdout = w
+	healer.RunFullCRDCleanup()
+	w.Close()
+	var buf bytes.Buffer
+	io.Copy(&buf, r)
+	os.Stdout = old
+
+	if !strings.Contains(buf.String(), "no CRD resources configured") {
+		t.Errorf("RunFullCRDCleanup() with no resources should print message; got %q", buf.String())
+	}
+}
+
+func TestHealer_RunFullCRDCleanup_Enabled(t *testing.T) {
+	healer, err := createTestHealer([]string{"default"})
+	if err != nil {
+		t.Fatalf("createTestHealer() error = %v", err)
+	}
+	// Fake dynamic client must register list kind for virtualmachines or List() panics
+	gvr := schema.GroupVersionResource{Group: "kubevirt.io", Version: "v1", Resource: "virtualmachines"}
+	healer.DynamicClient = dynamicfake.NewSimpleDynamicClientWithCustomListKinds(runtime.NewScheme(), map[schema.GroupVersionResource]string{gvr: "VirtualMachineList"})
+	// RunFullCRDCleanup should not panic; it will call checkCRDResources which lists resources
+	healer.RunFullCRDCleanup()
 }

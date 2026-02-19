@@ -82,6 +82,10 @@ suitable for both local development, test environments, and production environme
     from deletion while still monitoring them.\
 -   **Graceful Shutdown:** Handles OS signals cleanly (`Ctrl+C`,
     `SIGTERM`) for safe exits.\
+-   **Runtime signals (foreground or daemon):** Send `SIGUSR1` to run a
+    one-off full CRD cleanup of all pending resources; send `SIGUSR2` to
+    print a summary of how many CRDs were cleaned per type (e.g.
+    `kill -USR1 <pid>` or `kill -USR2 <pid>`).\
 -   **Daemon Mode:** Run as a background daemon with automatic
     log file redirection and PID file management.\
 -   **Cluster Information Display:** Automatically displays cluster summary
@@ -791,6 +795,10 @@ When running as a daemon:
 - A PID file is created (default: `/tmp/k8s-healer.pid`) for process management
 - The daemon responds to `SIGTERM` for graceful shutdown
 - If graceful shutdown fails, `SIGKILL` is sent after a timeout
+
+**Runtime signals (foreground or daemon):** While k8s-healer is running you can:
+- **SIGUSR1** — Run a one-off full CRD cleanup for all registered resource types (finish cleaning all pending resources). Example: `kill -USR1 $(cat /tmp/k8s-healer.pid)`
+- **SIGUSR2** — Print a summary of how many CRD resources were cleaned per type since start. Example: `kill -USR2 $(cat /tmp/k8s-healer.pid)`
 
 ### Example Daemon Usage
 

@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath" // Used for wildcard matching (Glob/Match)
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -526,9 +527,13 @@ func startHealer() {
 		}
 	}
 
-	// Setup signal handling (SIGINT/Ctrl+C and SIGTERM) for graceful shutdown.
+	// Setup signal handling: SIGINT/SIGTERM for shutdown; SIGUSR1 trigger full CRD cleanup; SIGUSR2 print CRD cleanup summary.
 	termCh := make(chan os.Signal, 1)
 	signal.Notify(termCh, syscall.SIGINT, syscall.SIGTERM)
+	cleanupCh := make(chan os.Signal, 1)
+	signal.Notify(cleanupCh, syscall.SIGUSR1)
+	summaryCh := make(chan os.Signal, 1)
+	signal.Notify(summaryCh, syscall.SIGUSR2)
 
 	// Start the main watch loop in a goroutine. This will start the informers.
 	watchDone := make(chan struct{})
@@ -537,13 +542,22 @@ func startHealer() {
 		close(watchDone)
 	}()
 
-	// Wait for termination signal or memory-limit restart request
-	select {
-	case <-termCh:
-		fmt.Println("\nTermination signal received. Shutting down healer...")
-	case <-healer.RestartRequested:
-		fmt.Println("\nMemory limit exceeded after sanitization — exiting for restart...")
+	// Wait for termination, restart, or user signals (cleanup/summary)
+	for {
+		select {
+		case <-termCh:
+			fmt.Println("\nTermination signal received. Shutting down healer...")
+			goto shutdown
+		case <-healer.RestartRequested:
+			fmt.Println("\nMemory limit exceeded after sanitization — exiting for restart...")
+			goto shutdown
+		case <-cleanupCh:
+			healer.RunFullCRDCleanup()
+		case <-summaryCh:
+			healer.PrintCRDCleanupSummary()
+		}
 	}
+shutdown:
 
 	// Close the StopCh channel to signal all concurrent informers to stop gracefully.
 	close(healer.StopCh)
@@ -559,6 +573,7 @@ func startHealer() {
 }
 
 func main() {
+	runtime.GOMAXPROCS(2)
 	if err := rootCmd.Execute(); err != nil {
 		fmt.Println(err)
 		os.Exit(1)

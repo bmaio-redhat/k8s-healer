@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -20,11 +21,11 @@ const (
 
 // DaemonConfig holds configuration for daemon mode
 type DaemonConfig struct {
-	PIDFile  string
-	LogFile  string
-	WorkDir  string
-	Args     []string
-	Env      []string
+	PIDFile string
+	LogFile string
+	WorkDir string
+	Args    []string
+	Env     []string
 }
 
 // StartDaemon forks the process and runs it as a daemon
@@ -43,7 +44,7 @@ func StartDaemon(config DaemonConfig) error {
 	// Prepare the command
 	cmd := exec.Command(execPath, config.Args...)
 	cmd.Env = append(os.Environ(), config.Env...)
-	
+
 	if config.WorkDir != "" {
 		cmd.Dir = config.WorkDir
 	}
@@ -90,6 +91,9 @@ func StartDaemon(config DaemonConfig) error {
 func StopDaemon(pidFile string) error {
 	pid, err := ReadPIDFile(pidFile)
 	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("daemon is not running: PID file not found at %s. If you started the daemon with a custom --pid-file, run: k8s-healer stop --pid-file <path>. To stop any running k8s-healer process: pkill -f k8s-healer", pidFile)
+		}
 		return fmt.Errorf("daemon is not running: %w", err)
 	}
 
@@ -110,7 +114,7 @@ func StopDaemon(pidFile string) error {
 
 	// Wait a bit and check if process is still running
 	time.Sleep(2 * time.Second)
-	
+
 	// Check if process is still alive by sending signal 0
 	if err := process.Signal(syscall.Signal(0)); err == nil {
 		// Process still running, force kill

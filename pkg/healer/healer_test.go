@@ -40,6 +40,7 @@ func createTestHealerWithExclusions(namespaces []string, excludedNamespaces []st
 		HealedNodes:                      make(map[string]time.Time),
 		HealedVMs:                        make(map[string]time.Time),
 		HealedCRDs:                       make(map[string]time.Time),
+		CRDCleanupCounts:                 make(map[string]int),
 		TrackedCRDs:                      make(map[string]bool),
 		HealCooldown:                     10 * time.Minute,
 		EnableVMHealing:                  true,

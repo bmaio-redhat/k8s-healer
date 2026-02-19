@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -44,8 +45,10 @@ type Healer struct {
 	healedVMsMu                      sync.RWMutex         // Protects HealedVMs map
 	HealedCRDs                       map[string]time.Time // Tracks recently cleaned CRDs
 	healedCRDsMu                     sync.RWMutex         // Protects HealedCRDs map
-	TrackedCRDs                      map[string]bool      // Tracks all CRD resources we've seen (for creation logging)
-	trackedCRDsMu                    sync.RWMutex         // Protects TrackedCRDs map
+	CRDCleanupCounts                 map[string]int      // Total CRD resources cleaned per type (e.g. "virtualmachines.kubevirt.io/v1")
+	crdCleanupCountsMu               sync.RWMutex       // Protects CRDCleanupCounts
+	TrackedCRDs                      map[string]bool     // Tracks all CRD resources we've seen (for creation logging)
+	trackedCRDsMu                    sync.RWMutex        // Protects TrackedCRDs map
 	HealCooldown                     time.Duration
 	EnableVMHealing                  bool                    // Flag to enable VM healing
 	EnableCRDCleanup                 bool                    // Flag to enable CRD cleanup
@@ -134,6 +137,7 @@ func NewHealer(kubeconfigPath string, namespaces []string, enableVMHealing bool,
 		HealedNodes:                      make(map[string]time.Time),
 		HealedVMs:                        make(map[string]time.Time),
 		HealedCRDs:                       make(map[string]time.Time),
+		CRDCleanupCounts:                 make(map[string]int),
 		TrackedCRDs:                      make(map[string]bool),
 		HealCooldown:                     10 * time.Minute, // default cooldown
 		EnableVMHealing:                  enableVMHealing,
@@ -1336,10 +1340,81 @@ func (h *Healer) doCRDCleanup(ctx context.Context, resource *unstructured.Unstru
 		return true, nil
 	}
 	fmt.Printf("   [SUCCESS] ✅ Deleted stale resource %s/%s/%s\n", gvr.Resource, resourceNamespace, resourceName)
+	h.RecordCRDCleanup(gvr)
 	h.trackedCRDsMu.Lock()
 	delete(h.TrackedCRDs, resourceKey)
 	h.trackedCRDsMu.Unlock()
 	return true, nil
+}
+
+// RecordCRDCleanup increments the cleanup count for the given GVR (for summary reporting).
+func (h *Healer) RecordCRDCleanup(gvr schema.GroupVersionResource) {
+	key := fmt.Sprintf("%s.%s/%s", gvr.Resource, gvr.Group, gvr.Version)
+	h.crdCleanupCountsMu.Lock()
+	defer h.crdCleanupCountsMu.Unlock()
+	if h.CRDCleanupCounts == nil {
+		h.CRDCleanupCounts = make(map[string]int)
+	}
+	h.CRDCleanupCounts[key]++
+}
+
+// RunFullCRDCleanup runs cleanup for all registered CRD resource types once (all watched namespaces).
+// Can be triggered by signal (e.g. SIGUSR1) to finish cleaning pending resources on demand.
+func (h *Healer) RunFullCRDCleanup() {
+	if !h.EnableCRDCleanup || len(h.CRDResources) == 0 {
+		fmt.Printf("   [INFO] CRD cleanup is disabled or no CRD resources configured.\n")
+		return
+	}
+	fmt.Printf("   [INFO] 🔄 Running full CRD cleanup for all %d resource types...\n", len(h.CRDResources))
+	var wg sync.WaitGroup
+	for _, crdResource := range h.CRDResources {
+		parts := strings.Split(crdResource, "/")
+		resourceAndGroup := parts[0]
+		version := ""
+		if len(parts) > 1 {
+			version = parts[1]
+		}
+		resourceParts := strings.Split(resourceAndGroup, ".")
+		if len(resourceParts) < 2 {
+			continue
+		}
+		resource := resourceParts[0]
+		group := strings.Join(resourceParts[1:], ".")
+		if version == "" {
+			version = "v1"
+		}
+		wg.Add(1)
+		go func(g, v, r string) {
+			defer wg.Done()
+			h.checkCRDResources(g, v, r)
+		}(group, version, resource)
+	}
+	wg.Wait()
+	fmt.Printf("   [INFO] ✅ Full CRD cleanup completed.\n")
+}
+
+// PrintCRDCleanupSummary prints how many CRD resources were cleaned up per type since start.
+func (h *Healer) PrintCRDCleanupSummary() {
+	h.crdCleanupCountsMu.RLock()
+	defer h.crdCleanupCountsMu.RUnlock()
+	if len(h.CRDCleanupCounts) == 0 {
+		fmt.Printf("   [INFO] CRD cleanup summary: 0 resources cleaned (no cleanups yet).\n")
+		return
+	}
+	total := 0
+	// Sort keys for stable output
+	keys := make([]string, 0, len(h.CRDCleanupCounts))
+	for k := range h.CRDCleanupCounts {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	fmt.Printf("   [INFO] CRD cleanup summary:\n")
+	for _, key := range keys {
+		c := h.CRDCleanupCounts[key]
+		total += c
+		fmt.Printf("      %s: %d\n", key, c)
+	}
+	fmt.Printf("   Total: %d resources cleaned\n", total)
 }
 
 // watchResourceOptimization periodically checks cluster resource strain and optimizes pods
