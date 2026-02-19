@@ -76,6 +76,8 @@ Usage Examples:
   k8s-healer start                         # Start as background daemon
   k8s-healer stop                          # Stop running daemon
   k8s-healer status                        # Check daemon status
+  k8s-healer cleanup                       # Signal daemon to run full CRD cleanup
+  k8s-healer summary                       # Signal daemon to print CRD cleanup summary
 `,
 	Run: func(cmd *cobra.Command, args []string) {
 		startHealer()
@@ -112,8 +114,8 @@ func init() {
 		"Enable resource creation throttling - warns when resources are created during cluster strain. Default: enabled.")
 	rootCmd.PersistentFlags().BoolVar(&daemonMode, "daemon", false,
 		"Run as a background daemon. Output will be redirected to log file.")
-	rootCmd.PersistentFlags().StringVar(&pidFile, "pid-file", daemon.DefaultPIDFile,
-		"Path to the PID file when running as daemon.")
+	rootCmd.PersistentFlags().StringVarP(&pidFile, "pid-file", "p", daemon.DefaultPIDFile,
+		"Path to the PID file. Supported in both foreground and daemon mode; parent directory is created if missing (e.g. -p /var/run/k8s-healer.pid).")
 	rootCmd.PersistentFlags().StringVar(&logFile, "log-file", daemon.DefaultLogFile,
 		"Path to the log file when running as daemon.")
 	rootCmd.PersistentFlags().BoolVar(&discoverEndpoints, "discover", false,
@@ -133,6 +135,8 @@ func init() {
 	rootCmd.AddCommand(daemonStartCmd)
 	rootCmd.AddCommand(daemonStopCmd)
 	rootCmd.AddCommand(daemonStatusCmd)
+	rootCmd.AddCommand(cleanupCmd)
+	rootCmd.AddCommand(summaryCmd)
 }
 
 // extractPrefixesFromNamespaces extracts prefixes from namespace names for prefix-based discovery.
@@ -306,9 +310,16 @@ var daemonStartCmd = &cobra.Command{
 		// Get all non-daemon flags to pass to the daemon process
 		daemonArgs := getDaemonArgs()
 
+		pf, lf := pidFile, logFile
+		if pf == "" {
+			pf = daemon.DefaultPIDFile
+		}
+		if lf == "" {
+			lf = daemon.DefaultLogFile
+		}
 		config := daemon.DaemonConfig{
-			PIDFile: pidFile,
-			LogFile: logFile,
+			PIDFile: pf,
+			LogFile: lf,
 			Args:    daemonArgs,
 		}
 
@@ -342,6 +353,59 @@ var daemonStatusCmd = &cobra.Command{
 			os.Exit(1)
 		}
 	},
+}
+
+// cleanupCmd signals the running daemon to run a one-off full CRD cleanup (finish cleaning all pending resources).
+func cleanupCmdRun(cmd *cobra.Command, args []string) {
+	if err := daemon.SendSignal(pidFile, syscall.SIGUSR1); err != nil {
+		fmt.Printf("Error: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Println("Sent cleanup signal to daemon. Full CRD cleanup is running.")
+}
+
+var cleanupCmd = &cobra.Command{
+	Use:   "cleanup",
+	Short: "Signal the daemon to run a one-off full CRD cleanup",
+	Long:  "Sends SIGUSR1 to the running k8s-healer daemon to trigger a one-off full CRD cleanup for all registered resource types. Use --pid-file if the daemon uses a custom PID file.",
+	Run:   cleanupCmdRun,
+}
+
+// summaryPathFromPIDFile returns the path where the daemon writes the summary when it receives SIGUSR2 (same directory as PID file).
+func summaryPathFromPIDFile(pidFile string) string {
+	if pidFile == "" {
+		pidFile = daemon.DefaultPIDFile
+	}
+	abs, _ := filepath.Abs(pidFile)
+	return filepath.Join(filepath.Dir(abs), "k8s-healer-summary.txt")
+}
+
+// summaryCmd signals the daemon to write the CRD cleanup summary to a file, then reads that file and prints it to stdout (no log file needed).
+func summaryCmdRun(cmd *cobra.Command, args []string) {
+	if err := daemon.SendSignal(pidFile, syscall.SIGUSR2); err != nil {
+		fmt.Printf("Error: %v\n", err)
+		os.Exit(1)
+	}
+	pf := pidFile
+	if pf == "" {
+		pf = daemon.DefaultPIDFile
+	}
+	summaryPath := summaryPathFromPIDFile(pf)
+	time.Sleep(400 * time.Millisecond) // give daemon time to write the summary file
+	data, err := os.ReadFile(summaryPath)
+	if err != nil {
+		fmt.Printf("Summary not ready or daemon not responding (check PID file path): %v\n", err)
+		os.Exit(1)
+	}
+	os.Remove(summaryPath) // clean up
+	fmt.Print(string(data))
+}
+
+var summaryCmd = &cobra.Command{
+	Use:   "summary",
+	Short: "Signal the daemon to write CRD cleanup summary and print it to stdout",
+	Long:  "Sends SIGUSR2 to the running k8s-healer daemon, which writes the CRD cleanup summary (counts per type and total) to a temp file. This command then reads that file and prints it directly to stdout. Use -p/--pid-file if the daemon uses a custom PID file path.",
+	Run:   summaryCmdRun,
 }
 
 // getDaemonArgs extracts all non-daemon flags to pass to the daemon process
@@ -391,8 +455,14 @@ func getDaemonArgs() []string {
 	}
 	// Add daemon flag so the child process knows it's running as daemon
 	args = append(args, "--daemon")
-	args = append(args, "--pid-file", pidFile)
-	args = append(args, "--log-file", logFile)
+	pf, lf := pidFile, logFile
+	if pf == "" {
+		pf = daemon.DefaultPIDFile
+	}
+	if lf == "" {
+		lf = daemon.DefaultLogFile
+	}
+	args = append(args, "--pid-file", pf, "--log-file", lf)
 
 	return args
 }
@@ -526,6 +596,17 @@ func startHealer() {
 		}
 	}
 
+	// Write PID file (foreground and --daemon). Creates directory if missing. When using "start" subcommand the parent also writes it in StartDaemon; here we ensure it exists for both direct run and --daemon. Remove on exit.
+	pf := pidFile
+	if pf == "" {
+		pf = daemon.DefaultPIDFile
+	}
+	if err := daemon.WritePIDFile(pf, os.Getpid()); err != nil {
+		fmt.Printf("Warning: Failed to write PID file at %s: %v\n", pf, err)
+	} else {
+		defer os.Remove(pf)
+	}
+
 	// Setup signal handling: SIGINT/SIGTERM for shutdown; SIGUSR1 trigger full CRD cleanup; SIGUSR2 print CRD cleanup summary.
 	termCh := make(chan os.Signal, 1)
 	signal.Notify(termCh, syscall.SIGINT, syscall.SIGTERM)
@@ -553,7 +634,13 @@ func startHealer() {
 		case <-cleanupCh:
 			healer.RunFullCRDCleanup()
 		case <-summaryCh:
-			healer.PrintCRDCleanupSummary()
+			summaryPath := summaryPathFromPIDFile(pidFile)
+			if f, err := os.Create(summaryPath); err == nil {
+				healer.PrintCRDCleanupSummaryTo(f)
+				f.Close()
+			} else {
+				healer.PrintCRDCleanupSummary() // fallback to stdout/log
+			}
 		}
 	}
 shutdown:

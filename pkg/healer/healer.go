@@ -3,6 +3,7 @@ package healer
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -1393,28 +1394,32 @@ func (h *Healer) RunFullCRDCleanup() {
 	fmt.Printf("   [INFO] ✅ Full CRD cleanup completed.\n")
 }
 
-// PrintCRDCleanupSummary prints how many CRD resources were cleaned up per type since start.
+// PrintCRDCleanupSummary prints how many CRD resources were cleaned up per type since start to stdout.
 func (h *Healer) PrintCRDCleanupSummary() {
+	h.PrintCRDCleanupSummaryTo(os.Stdout)
+}
+
+// PrintCRDCleanupSummaryTo writes the CRD cleanup summary (counts per type and total) to w.
+func (h *Healer) PrintCRDCleanupSummaryTo(w io.Writer) {
 	h.crdCleanupCountsMu.RLock()
 	defer h.crdCleanupCountsMu.RUnlock()
 	if len(h.CRDCleanupCounts) == 0 {
-		fmt.Printf("   [INFO] CRD cleanup summary: 0 resources cleaned (no cleanups yet).\n")
+		fmt.Fprintf(w, "CRD cleanup summary: 0 resources cleaned (no cleanups yet).\n")
 		return
 	}
 	total := 0
-	// Sort keys for stable output
 	keys := make([]string, 0, len(h.CRDCleanupCounts))
 	for k := range h.CRDCleanupCounts {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
-	fmt.Printf("   [INFO] CRD cleanup summary:\n")
+	fmt.Fprintf(w, "CRD cleanup summary:\n")
 	for _, key := range keys {
 		c := h.CRDCleanupCounts[key]
 		total += c
-		fmt.Printf("      %s: %d\n", key, c)
+		fmt.Fprintf(w, "  %s: %d\n", key, c)
 	}
-	fmt.Printf("   Total: %d resources cleaned\n", total)
+	fmt.Fprintf(w, "Total: %d resources cleaned\n", total)
 }
 
 // watchResourceOptimization periodically checks cluster resource strain and optimizes pods

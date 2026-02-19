@@ -155,6 +155,26 @@ func StatusDaemon(pidFile string) error {
 	return nil
 }
 
+// SendSignal sends a signal to the daemon process (e.g. SIGUSR1, SIGUSR2).
+// Use this to trigger cleanup (SIGUSR1) or summary (SIGUSR2) on a running daemon.
+func SendSignal(pidFile string, sig syscall.Signal) error {
+	pid, err := ReadPIDFile(pidFile)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("daemon is not running: PID file not found at %s (use --pid-file if you use a custom path)", pidFile)
+		}
+		return fmt.Errorf("daemon is not running: %w", err)
+	}
+	process, err := os.FindProcess(pid)
+	if err != nil {
+		return fmt.Errorf("process %d not found: %w", pid, err)
+	}
+	if err := process.Signal(sig); err != nil {
+		return fmt.Errorf("failed to send signal to process %d: %w", pid, err)
+	}
+	return nil
+}
+
 // IsRunning checks if the daemon is running by checking the PID file
 func IsRunning(pidFile string) bool {
 	pid, err := ReadPIDFile(pidFile)
@@ -178,6 +198,17 @@ func IsRunning(pidFile string) bool {
 
 // WritePIDFile writes the PID to a file
 func WritePIDFile(pidFile string, pid int) error {
+	if pidFile == "" {
+		pidFile = DefaultPIDFile
+	}
+	// Use absolute path so the file is always created in a predictable location
+	if !filepath.IsAbs(pidFile) {
+		abs, err := filepath.Abs(pidFile)
+		if err != nil {
+			return fmt.Errorf("failed to resolve PID file path: %w", err)
+		}
+		pidFile = abs
+	}
 	// Create directory if it doesn't exist
 	dir := filepath.Dir(pidFile)
 	if err := os.MkdirAll(dir, 0755); err != nil {

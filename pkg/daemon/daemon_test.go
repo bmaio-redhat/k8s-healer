@@ -3,6 +3,7 @@ package daemon
 import (
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 )
 
@@ -118,6 +119,46 @@ func TestWritePIDFile_CreatesDirectory(t *testing.T) {
 	// Verify file exists
 	if _, err := os.Stat(pidFile); os.IsNotExist(err) {
 		t.Fatalf("PID file was not created")
+	}
+}
+
+// TestWritePIDFile_RelativePathBecomesAbsolute verifies that a relative PID file path is resolved to absolute.
+func TestWritePIDFile_RelativePathBecomesAbsolute(t *testing.T) {
+	tmpDir := t.TempDir()
+	origWd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Getwd: %v", err)
+	}
+	defer os.Chdir(origWd)
+	if err := os.Chdir(tmpDir); err != nil {
+		t.Fatalf("Chdir: %v", err)
+	}
+
+	pid := 54321
+	err = WritePIDFile("custom.pid", pid)
+	if err != nil {
+		t.Fatalf("WritePIDFile() error = %v", err)
+	}
+
+	// File should exist at tmpDir/custom.pid (resolved to absolute)
+	absPath := filepath.Join(tmpDir, "custom.pid")
+	if _, err := os.Stat(absPath); os.IsNotExist(err) {
+		t.Fatalf("PID file was not created at resolved path %s", absPath)
+	}
+	data, err := os.ReadFile(absPath)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if string(data) != "54321\n" {
+		t.Errorf("PID file content = %q, want %q", string(data), "54321\n")
+	}
+}
+
+// TestSendSignal_EmptyPathReturnsError verifies that SendSignal with empty pid file path returns an error.
+func TestSendSignal_EmptyPathReturnsError(t *testing.T) {
+	err := SendSignal("", syscall.SIGUSR2)
+	if err == nil {
+		t.Error("SendSignal() with empty path expected error, got nil")
 	}
 }
 

@@ -527,9 +527,10 @@ By default, the tool authenticates using your local **Kubeconfig** file
                            Output will be redirected to      
                            log file.                         
 
-  `--pid-file`             Path to the PID file when         `--pid-file /var/run/k8s-healer.pid`
-                           running as daemon (default:       
-                           `/tmp/k8s-healer.pid`).           
+  `-p, --pid-file`         Path to the PID file. Supported in  `-p .pids/k8s-healer.pid`
+                           both foreground and daemon mode;
+                           parent directory is created if
+                           missing. Default: `/tmp/k8s-healer.pid`.
 
   `--log-file`             Path to the log file when         `--log-file /var/log/k8s-healer.log`
                            running as daemon (default:        
@@ -758,6 +759,8 @@ Run as a background process - output goes to a log file. Use `stop` command to t
 -   **`start`**: Start k8s-healer as a background daemon
 -   **`stop`**: Stop the running daemon gracefully (sends SIGTERM, then SIGKILL if needed)
 -   **`status`**: Check if the daemon is currently running
+-   **`cleanup`**: Signal the daemon to run a one-off full CRD cleanup (finish all pending resources)
+-   **`summary`**: Signal the daemon to write the CRD cleanup summary; output is printed directly to stdout (no log file needed)
 -   **`restart`**: Stop and start the daemon
 -   **`logs`**: View daemon logs
 
@@ -792,13 +795,15 @@ kill -9 $(cat .k8s-healer.pid)
 When running as a daemon:
 - The process runs in the background (detached from terminal)
 - All output is redirected to a log file (default: `/tmp/k8s-healer.log`)
-- A PID file is created (default: `/tmp/k8s-healer.pid`) for process management
+- A PID file is created (default: `/tmp/k8s-healer.pid`) for process management. With `-p`, the path is used in both foreground and daemon mode; the parent directory is created if it does not exist.
 - The daemon responds to `SIGTERM` for graceful shutdown
 - If graceful shutdown fails, `SIGKILL` is sent after a timeout
 
-**Runtime signals (foreground or daemon):** While k8s-healer is running you can:
-- **SIGUSR1** — Run a one-off full CRD cleanup for all registered resource types (finish cleaning all pending resources). Example: `kill -USR1 $(cat /tmp/k8s-healer.pid)`
-- **SIGUSR2** — Print a summary of how many CRD resources were cleaned per type since start. Example: `kill -USR2 $(cat /tmp/k8s-healer.pid)`
+**Runtime signals (foreground or daemon):** While k8s-healer is running you can trigger cleanup or summary via signals or via commands:
+- **Cleanup (finish all pending CRD cleanup):** `k8s-healer cleanup` or `kill -USR1 $(cat /tmp/k8s-healer.pid)`
+- **Summary (report counts per CRD type):** `k8s-healer summary` — signals the daemon and prints the summary directly to stdout. With a custom PID path use `-p` (e.g. `k8s-healer summary -p /var/run/k8s-healer.pid`). No log file is required.
+
+Use `-p/--pid-file` with the commands if the daemon was started with a custom PID path (e.g. `k8s-healer start -p /var/run/k8s-healer.pid`; then `k8s-healer summary -p /var/run/k8s-healer.pid`).
 
 ### Example Daemon Usage
 
