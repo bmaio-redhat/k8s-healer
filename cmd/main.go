@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"os"
@@ -77,7 +78,8 @@ Usage Examples:
   k8s-healer stop                          # Stop running daemon
   k8s-healer status                        # Check daemon status
   k8s-healer cleanup                       # Signal daemon to run full CRD cleanup
-  k8s-healer summary                       # Signal daemon to print CRD cleanup summary
+  k8s-healer summary                       # Signal daemon to print CRD creation summary as ASCII table to stdout
+  k8s-healer summary -p /var/run/healer.pid # Custom PID file path
 `,
 	Run: func(cmd *cobra.Command, args []string) {
 		startHealer()
@@ -371,40 +373,61 @@ var cleanupCmd = &cobra.Command{
 	Run:   cleanupCmdRun,
 }
 
-// summaryPathFromPIDFile returns the path where the daemon writes the summary when it receives SIGUSR2 (same directory as PID file).
+// summaryPathFromPIDFile returns the path where the daemon writes the summary table (same directory as PID file). Exported for testing.
 func summaryPathFromPIDFile(pidFile string) string {
 	if pidFile == "" {
 		pidFile = daemon.DefaultPIDFile
 	}
 	abs, _ := filepath.Abs(pidFile)
-	return filepath.Join(filepath.Dir(abs), "k8s-healer-summary.txt")
+	return filepath.Join(filepath.Dir(abs), "k8s-healer-summary.out")
 }
 
-// summaryCmd signals the daemon to write the CRD cleanup summary to a file, then reads that file and prints it to stdout (no log file needed).
-func summaryCmdRun(cmd *cobra.Command, args []string) {
-	if err := daemon.SendSignal(pidFile, syscall.SIGUSR2); err != nil {
-		fmt.Printf("Error: %v\n", err)
-		os.Exit(1)
-	}
+// SummaryPath returns the default path for the summary file (same directory as PID file). Exported for testing.
+func SummaryPath(pidFile string) string {
 	pf := pidFile
 	if pf == "" {
 		pf = daemon.DefaultPIDFile
 	}
-	summaryPath := summaryPathFromPIDFile(pf)
-	time.Sleep(400 * time.Millisecond) // give daemon time to write the summary file
-	data, err := os.ReadFile(summaryPath)
-	if err != nil {
-		fmt.Printf("Summary not ready or daemon not responding (check PID file path): %v\n", err)
+	return summaryPathFromPIDFile(pf)
+}
+
+// summaryOutputPath returns the path where the daemon writes the summary table on SIGUSR2 (same dir as PID file). Client reads from here and prints to CLI.
+func summaryOutputPath() string {
+	return SummaryPath(pidFile)
+}
+
+// writeSummaryToPath creates the parent directory of path if it does not exist, then writes data to path. Exported for testing.
+func writeSummaryToPath(path string, data []byte) error {
+	if dir := filepath.Dir(path); dir != "" {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return err
+		}
+	}
+	return os.WriteFile(path, data, 0644)
+}
+
+// summaryCmd sends SIGUSR2 to the daemon; daemon writes an ASCII table to a temp path; client reads and prints it to the CLI.
+func summaryCmdRun(cmd *cobra.Command, args []string) {
+	outPath := summaryOutputPath()
+	if err := daemon.SendSignal(pidFile, syscall.SIGUSR2); err != nil {
+		fmt.Printf("Error: %v\n", err)
 		os.Exit(1)
 	}
-	os.Remove(summaryPath) // clean up
+	time.Sleep(1500 * time.Millisecond) // give daemon time to refresh stats and write table
+
+	data, err := os.ReadFile(outPath)
+	if err != nil {
+		fmt.Printf("Summary not ready or daemon not responding (check PID file path with -p): %v\n", err)
+		os.Exit(1)
+	}
+	defer os.Remove(outPath)
 	fmt.Print(string(data))
 }
 
 var summaryCmd = &cobra.Command{
 	Use:   "summary",
-	Short: "Signal the daemon to write CRD cleanup summary and print it to stdout",
-	Long:  "Sends SIGUSR2 to the running k8s-healer daemon, which writes the CRD cleanup summary (counts per type and total) to a temp file. This command then reads that file and prints it directly to stdout. Use -p/--pid-file if the daemon uses a custom PID file path.",
+	Short: "Print CRD creation summary as an ASCII table (requests data from running daemon)",
+	Long:  "Sends SIGUSR2 to the running daemon; the daemon writes the summary as an ASCII table to a temp file; this command reads it and prints to the terminal. Use -p/--pid-file if the daemon uses a custom PID file.",
 	Run:   summaryCmdRun,
 }
 
@@ -483,6 +506,18 @@ func startHealer() {
 		if err := daemon.RedirectOutput(logFile); err != nil {
 			fmt.Printf("Warning: Failed to redirect output to log file: %v\n", err)
 		}
+	}
+
+	// Write PID file early (foreground and daemon) so it exists as soon as the process is running.
+	// Creates parent directory if missing. When using "start" subcommand the parent also writes it in StartDaemon; the child overwrites here. Removed on exit.
+	pf := pidFile
+	if pf == "" {
+		pf = daemon.DefaultPIDFile
+	}
+	if err := daemon.WritePIDFile(pf, os.Getpid()); err != nil {
+		fmt.Printf("Warning: Failed to write PID file at %s: %v\n", pf, err)
+	} else {
+		defer os.Remove(pf)
 	}
 
 	// Parse excluded namespaces
@@ -596,18 +631,7 @@ func startHealer() {
 		}
 	}
 
-	// Write PID file (foreground and --daemon). Creates directory if missing. When using "start" subcommand the parent also writes it in StartDaemon; here we ensure it exists for both direct run and --daemon. Remove on exit.
-	pf := pidFile
-	if pf == "" {
-		pf = daemon.DefaultPIDFile
-	}
-	if err := daemon.WritePIDFile(pf, os.Getpid()); err != nil {
-		fmt.Printf("Warning: Failed to write PID file at %s: %v\n", pf, err)
-	} else {
-		defer os.Remove(pf)
-	}
-
-	// Setup signal handling: SIGINT/SIGTERM for shutdown; SIGUSR1 trigger full CRD cleanup; SIGUSR2 print CRD cleanup summary.
+	// Setup signal handling: SIGINT/SIGTERM for shutdown; SIGUSR1 trigger full CRD cleanup; SIGUSR2 print CRD creation summary (ASCII table).
 	termCh := make(chan os.Signal, 1)
 	signal.Notify(termCh, syscall.SIGINT, syscall.SIGTERM)
 	cleanupCh := make(chan os.Signal, 1)
@@ -634,12 +658,12 @@ func startHealer() {
 		case <-cleanupCh:
 			healer.RunFullCRDCleanup()
 		case <-summaryCh:
-			summaryPath := summaryPathFromPIDFile(pidFile)
-			if f, err := os.Create(summaryPath); err == nil {
-				healer.PrintCRDCleanupSummaryTo(f)
-				f.Close()
-			} else {
-				healer.PrintCRDCleanupSummary() // fallback to stdout/log
+			healer.RefreshCRDCreationStats()
+			outPath := summaryOutputPath()
+			var buf bytes.Buffer
+			healer.PrintCRDCleanupSummaryTable(&buf)
+			if writeErr := writeSummaryToPath(outPath, buf.Bytes()); writeErr != nil {
+				fmt.Printf("   [WARN] Failed to write summary: %v\n", writeErr)
 			}
 		}
 	}

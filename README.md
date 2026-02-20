@@ -84,8 +84,8 @@ suitable for both local development, test environments, and production environme
     `SIGTERM`) for safe exits.\
 -   **Runtime signals (foreground or daemon):** Send `SIGUSR1` to run a
     one-off full CRD cleanup of all pending resources; send `SIGUSR2` to
-    print a summary of how many CRDs were cleaned per type (e.g.
-    `kill -USR1 <pid>` or `kill -USR2 <pid>`).\
+    print a summary of created CRD resources (counts per type) as an ASCII
+    table (e.g. `kill -USR1 <pid>` or `kill -USR2 <pid>`).\
 -   **Daemon Mode:** Run as a background daemon with automatic
     log file redirection and PID file management.\
 -   **Cluster Information Display:** Automatically displays cluster summary
@@ -760,7 +760,7 @@ Run as a background process - output goes to a log file. Use `stop` command to t
 -   **`stop`**: Stop the running daemon gracefully (sends SIGTERM, then SIGKILL if needed)
 -   **`status`**: Check if the daemon is currently running
 -   **`cleanup`**: Signal the daemon to run a one-off full CRD cleanup (finish all pending resources)
--   **`summary`**: Signal the daemon to write the CRD cleanup summary; output is printed directly to stdout (no log file needed)
+-   **`summary`**: Signal the daemon to print the CRD creation summary as an ASCII table; output is printed directly to stdout (no file output)
 -   **`restart`**: Stop and start the daemon
 -   **`logs`**: View daemon logs
 
@@ -801,7 +801,7 @@ When running as a daemon:
 
 **Runtime signals (foreground or daemon):** While k8s-healer is running you can trigger cleanup or summary via signals or via commands:
 - **Cleanup (finish all pending CRD cleanup):** `k8s-healer cleanup` or `kill -USR1 $(cat /tmp/k8s-healer.pid)`
-- **Summary (report counts per CRD type):** `k8s-healer summary` — signals the daemon and prints the summary directly to stdout. With a custom PID path use `-p` (e.g. `k8s-healer summary -p /var/run/k8s-healer.pid`). No log file is required.
+- **Summary (created CRD resources, ASCII table):** `k8s-healer summary` — signals the daemon and prints the creation summary as an ASCII table to stdout. With a custom PID path use `-p` (e.g. `k8s-healer summary -p /var/run/k8s-healer.pid`). No file output or log file is required.
 
 Use `-p/--pid-file` with the commands if the daemon was started with a custom PID path (e.g. `k8s-healer start -p /var/run/k8s-healer.pid`; then `k8s-healer summary -p /var/run/k8s-healer.pid`).
 

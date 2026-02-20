@@ -2,6 +2,7 @@ package healer
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -16,6 +17,7 @@ import (
 	"github.com/bmaio-redhat/k8s-healer/pkg/healthcheck"
 	"github.com/bmaio-redhat/k8s-healer/pkg/util"
 	v1 "k8s.io/api/core/v1"
+	corev1resource "k8s.io/apimachinery/pkg/api/resource"
 	policyv1 "k8s.io/api/policy/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -30,6 +32,23 @@ import (
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/clientcmd"
 )
+
+// CRDCleanupStats holds per-GVR aggregate stats for CRD cleanup (count, lifetime, cluster resources). Used only for cleanup; summary reports creation stats.
+type CRDCleanupStats struct {
+	Count            int           // Number of resources cleaned
+	TotalLifetime    time.Duration // Sum of (deletion time - creation time) for avg lifetime
+	TotalCPUMillis   int64         // Sum of CPU requests in millicores (for avg cluster CPU)
+	TotalMemMB       int64         // Sum of memory requests in MiB (for avg cluster memory)
+	WithResourceInfo int           // Count of resources that had extractable CPU/memory
+}
+
+// CRDCreationStats holds per-GVR aggregate stats for CRD resources created (for summary: count and cluster resources at creation).
+type CRDCreationStats struct {
+	Count            int   // Number of resources created
+	TotalCPUMillis   int64 // Sum of CPU requests in millicores (for avg cluster CPU)
+	TotalMemMB       int64 // Sum of memory requests in MiB (for avg cluster memory)
+	WithResourceInfo int   // Count of resources that had extractable CPU/memory
+}
 
 // Healer holds the Kubernetes client and configuration for watching.
 type Healer struct {
@@ -46,9 +65,11 @@ type Healer struct {
 	healedVMsMu                      sync.RWMutex         // Protects HealedVMs map
 	HealedCRDs                       map[string]time.Time // Tracks recently cleaned CRDs
 	healedCRDsMu                     sync.RWMutex         // Protects HealedCRDs map
-	CRDCleanupCounts                 map[string]int      // Total CRD resources cleaned per type (e.g. "virtualmachines.kubevirt.io/v1")
-	crdCleanupCountsMu               sync.RWMutex       // Protects CRDCleanupCounts
-	TrackedCRDs                      map[string]bool     // Tracks all CRD resources we've seen (for creation logging)
+	CRDCleanupStats                  map[string]*CRDCleanupStats  // Per-GVR cleanup stats (not used for summary output)
+	crdCleanupCountsMu               sync.RWMutex                 // Protects CRDCleanupStats
+	CRDCreationStats                 map[string]*CRDCreationStats // Per-GVR creation stats (for summary: aggregated created resources)
+	crdCreationStatsMu               sync.RWMutex                 // Protects CRDCreationStats
+	TrackedCRDs                      map[string]bool               // Tracks all CRD resources we've seen (for creation logging)
 	trackedCRDsMu                    sync.RWMutex        // Protects TrackedCRDs map
 	HealCooldown                     time.Duration
 	EnableVMHealing                  bool                    // Flag to enable VM healing
@@ -138,7 +159,8 @@ func NewHealer(kubeconfigPath string, namespaces []string, enableVMHealing bool,
 		HealedNodes:                      make(map[string]time.Time),
 		HealedVMs:                        make(map[string]time.Time),
 		HealedCRDs:                       make(map[string]time.Time),
-		CRDCleanupCounts:                 make(map[string]int),
+		CRDCleanupStats:                  make(map[string]*CRDCleanupStats),
+		CRDCreationStats:                 make(map[string]*CRDCreationStats),
 		TrackedCRDs:                      make(map[string]bool),
 		HealCooldown:                     10 * time.Minute, // default cooldown
 		EnableVMHealing:                  enableVMHealing,
@@ -1161,6 +1183,9 @@ func (h *Healer) logCRDCreation(resource *unstructured.Unstructured, gvr schema.
 		fmt.Printf("   [INFO] ✨ New CRD resource created: %s/%s/%s (age: %v)\n",
 			gvr.Resource, resource.GetNamespace(), resource.GetName(), age.Round(time.Second))
 
+		// Aggregate for summary (created resources; no need to wait for deletion)
+		h.RecordCRDCreation(resource, gvr)
+
 		// Mark as tracked
 		h.trackedCRDsMu.Lock()
 		h.TrackedCRDs[resourceKey] = true
@@ -1341,22 +1366,149 @@ func (h *Healer) doCRDCleanup(ctx context.Context, resource *unstructured.Unstru
 		return true, nil
 	}
 	fmt.Printf("   [SUCCESS] ✅ Deleted stale resource %s/%s/%s\n", gvr.Resource, resourceNamespace, resourceName)
-	h.RecordCRDCleanup(gvr)
+	h.RecordCRDCleanup(resource, gvr)
 	h.trackedCRDsMu.Lock()
 	delete(h.TrackedCRDs, resourceKey)
 	h.trackedCRDsMu.Unlock()
 	return true, nil
 }
 
-// RecordCRDCleanup increments the cleanup count for the given GVR (for summary reporting).
-func (h *Healer) RecordCRDCleanup(gvr schema.GroupVersionResource) {
+// extractResourceUsage tries to extract CPU (millicores) and memory (MiB) from a CRD (e.g. KubeVirt VM/VMI).
+// Returns 0, 0 when not found or on parse error.
+func extractResourceUsage(res *unstructured.Unstructured, gvr schema.GroupVersionResource) (cpuMillis int64, memMB int64) {
+	obj := res.Object
+	// KubeVirt VM: spec.template.spec.domain
+	template, ok := obj["spec"].(map[string]interface{})
+	if ok {
+		if spec, ok := template["template"].(map[string]interface{}); ok {
+			if domain, ok := spec["spec"].(map[string]interface{}); ok {
+				cpuMillis, memMB = parseDomainResources(domain)
+				if cpuMillis > 0 || memMB > 0 {
+					return cpuMillis, memMB
+				}
+			}
+		}
+	}
+	// KubeVirt VMI / some CRDs: spec.domain
+	if spec, ok := obj["spec"].(map[string]interface{}); ok {
+		if domain, ok := spec["domain"].(map[string]interface{}); ok {
+			cpuMillis, memMB = parseDomainResources(domain)
+		}
+	}
+	return cpuMillis, memMB
+}
+
+func parseDomainResources(domain map[string]interface{}) (cpuMillis int64, memMB int64) {
+	// domain.resources.requests.cpu / .memory
+	if res, ok := domain["resources"].(map[string]interface{}); ok {
+		if req, ok := res["requests"].(map[string]interface{}); ok {
+			if c, ok := req["cpu"].(string); ok && c != "" {
+				q, err := corev1resource.ParseQuantity(c)
+				if err == nil {
+					cpuMillis = q.MilliValue()
+				}
+			}
+			if m, ok := req["memory"].(string); ok && m != "" {
+				q, err := corev1resource.ParseQuantity(m)
+				if err == nil {
+					memMB = q.Value() / (1024 * 1024) // bytes -> MiB
+				}
+			}
+		}
+	}
+	if cpuMillis > 0 || memMB > 0 {
+		return cpuMillis, memMB
+	}
+	// domain.cpu (sockets/cores/threads) -> vCPUs as millicores (1 vCPU = 1000m)
+	if cpu, ok := domain["cpu"].(map[string]interface{}); ok {
+		sockets, _ := toInt64(cpu["sockets"])
+		cores, _ := toInt64(cpu["cores"])
+		threads, _ := toInt64(cpu["threads"])
+		if sockets == 0 {
+			sockets = 1
+		}
+		if cores == 0 {
+			cores = 1
+		}
+		if threads == 0 {
+			threads = 1
+		}
+		cpuMillis = sockets * cores * threads * 1000
+	}
+	// domain.memory.guest
+	if mem, ok := domain["memory"].(map[string]interface{}); ok {
+		if g, ok := mem["guest"].(string); ok && g != "" {
+			q, err := corev1resource.ParseQuantity(g)
+			if err == nil {
+				memMB = q.Value() / (1024 * 1024)
+			}
+		}
+	}
+	return cpuMillis, memMB
+}
+
+func toInt64(v interface{}) (int64, bool) {
+	switch x := v.(type) {
+	case int64:
+		return x, true
+	case int:
+		return int64(x), true
+	case float64:
+		return int64(x), true
+	default:
+		return 0, false
+	}
+}
+
+// RecordCRDCreation records a created resource for the given GVR for summary (count and cluster resources at creation).
+func (h *Healer) RecordCRDCreation(resource *unstructured.Unstructured, gvr schema.GroupVersionResource) {
+	key := fmt.Sprintf("%s.%s/%s", gvr.Resource, gvr.Group, gvr.Version)
+	h.crdCreationStatsMu.Lock()
+	defer h.crdCreationStatsMu.Unlock()
+	if h.CRDCreationStats == nil {
+		h.CRDCreationStats = make(map[string]*CRDCreationStats)
+	}
+	st, ok := h.CRDCreationStats[key]
+	if !ok {
+		st = &CRDCreationStats{}
+		h.CRDCreationStats[key] = st
+	}
+	st.Count++
+	cpuMillis, memMB := extractResourceUsage(resource, gvr)
+	if cpuMillis > 0 || memMB > 0 {
+		st.TotalCPUMillis += cpuMillis
+		st.TotalMemMB += memMB
+		st.WithResourceInfo++
+	}
+}
+
+// RecordCRDCleanup records a cleanup for the given GVR, optionally with resource for lifetime and cluster resource stats.
+func (h *Healer) RecordCRDCleanup(resource *unstructured.Unstructured, gvr schema.GroupVersionResource) {
 	key := fmt.Sprintf("%s.%s/%s", gvr.Resource, gvr.Group, gvr.Version)
 	h.crdCleanupCountsMu.Lock()
 	defer h.crdCleanupCountsMu.Unlock()
-	if h.CRDCleanupCounts == nil {
-		h.CRDCleanupCounts = make(map[string]int)
+	if h.CRDCleanupStats == nil {
+		h.CRDCleanupStats = make(map[string]*CRDCleanupStats)
 	}
-	h.CRDCleanupCounts[key]++
+	st, ok := h.CRDCleanupStats[key]
+	if !ok {
+		st = &CRDCleanupStats{}
+		h.CRDCleanupStats[key] = st
+	}
+	st.Count++
+	var lifetime time.Duration
+	if resource != nil {
+		if t := resource.GetCreationTimestamp(); !t.IsZero() {
+			lifetime = time.Since(t.Time)
+			st.TotalLifetime += lifetime
+		}
+		cpuMillis, memMB := extractResourceUsage(resource, gvr)
+		if cpuMillis > 0 || memMB > 0 {
+			st.TotalCPUMillis += cpuMillis
+			st.TotalMemMB += memMB
+			st.WithResourceInfo++
+		}
+	}
 }
 
 // RunFullCRDCleanup runs cleanup for all registered CRD resource types once (all watched namespaces).
@@ -1394,32 +1546,361 @@ func (h *Healer) RunFullCRDCleanup() {
 	fmt.Printf("   [INFO] ✅ Full CRD cleanup completed.\n")
 }
 
-// PrintCRDCleanupSummary prints how many CRD resources were cleaned up per type since start to stdout.
-func (h *Healer) PrintCRDCleanupSummary() {
-	h.PrintCRDCleanupSummaryTo(os.Stdout)
-}
-
-// PrintCRDCleanupSummaryTo writes the CRD cleanup summary (counts per type and total) to w.
-func (h *Healer) PrintCRDCleanupSummaryTo(w io.Writer) {
-	h.crdCleanupCountsMu.RLock()
-	defer h.crdCleanupCountsMu.RUnlock()
-	if len(h.CRDCleanupCounts) == 0 {
-		fmt.Fprintf(w, "CRD cleanup summary: 0 resources cleaned (no cleanups yet).\n")
+// RefreshCRDCreationStats runs one pass of listing all CRD resources (all GVRs, all namespaces) and records any not yet seen so the creation summary is up-to-date. Call before writing the summary so resources created since the last 30s tick are included.
+func (h *Healer) RefreshCRDCreationStats() {
+	if !h.EnableCRDCleanup || len(h.CRDResources) == 0 {
 		return
 	}
-	total := 0
-	keys := make([]string, 0, len(h.CRDCleanupCounts))
-	for k := range h.CRDCleanupCounts {
+	var wg sync.WaitGroup
+	for _, crdResource := range h.CRDResources {
+		parts := strings.Split(crdResource, "/")
+		resourceAndGroup := parts[0]
+		version := ""
+		if len(parts) > 1 {
+			version = parts[1]
+		}
+		resourceParts := strings.Split(resourceAndGroup, ".")
+		if len(resourceParts) < 2 {
+			continue
+		}
+		resource := resourceParts[0]
+		group := strings.Join(resourceParts[1:], ".")
+		if version == "" {
+			version = "v1"
+		}
+		wg.Add(1)
+		go func(g, v, r string) {
+			defer wg.Done()
+			h.checkCRDResources(g, v, r)
+		}(group, version, resource)
+	}
+	wg.Wait()
+}
+
+// PrintCRDCleanupSummary prints the CRD creation summary as an ASCII table to stdout.
+func (h *Healer) PrintCRDCleanupSummary() {
+	h.PrintCRDCleanupSummaryTable(os.Stdout)
+}
+
+// displayGroup returns a short label for grouping summary rows (VM, CDI, Snapshot, etc.).
+func displayGroup(gvrKey string) string {
+	switch {
+	case strings.Contains(gvrKey, "virtualmachine") && !strings.Contains(gvrKey, "instancemigration") && !strings.Contains(gvrKey, "snapshot") && !strings.Contains(gvrKey, "clone") && !strings.Contains(gvrKey, "migration"):
+		return "VM"
+	case strings.Contains(gvrKey, "datavolume") || strings.Contains(gvrKey, "datasource"):
+		return "CDI"
+	case strings.Contains(gvrKey, "snapshot") || strings.Contains(gvrKey, "clone"):
+		return "Snapshot / Clone"
+	case strings.Contains(gvrKey, "network") || strings.Contains(gvrKey, "cni") || strings.Contains(gvrKey, "ovn"):
+		return "Network"
+	case strings.Contains(gvrKey, "template"):
+		return "Template"
+	case strings.Contains(gvrKey, "instancetype") || strings.Contains(gvrKey, "preference"):
+		return "Instance type"
+	case strings.Contains(gvrKey, "migration"):
+		return "Migration"
+	default:
+		return "Other"
+	}
+}
+
+// PrintCRDCleanupSummaryTo writes the CRD creation summary as Markdown: aggregated created resources by group, count, average cluster CPU/memory (no deletion required).
+func (h *Healer) PrintCRDCleanupSummaryTo(w io.Writer) {
+	h.crdCreationStatsMu.RLock()
+	defer h.crdCreationStatsMu.RUnlock()
+	if len(h.CRDCreationStats) == 0 {
+		fmt.Fprintf(w, "# CRD resource summary (created)\n\n0 resources created (no creations yet).\n")
+		return
+	}
+	keys := make([]string, 0, len(h.CRDCreationStats))
+	for k := range h.CRDCreationStats {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
-	fmt.Fprintf(w, "CRD cleanup summary:\n")
-	for _, key := range keys {
-		c := h.CRDCleanupCounts[key]
-		total += c
-		fmt.Fprintf(w, "  %s: %d\n", key, c)
+
+	// Group keys by display group for section ordering
+	groupOrder := []string{"VM", "CDI", "Snapshot / Clone", "Instance type", "Migration", "Network", "Template", "Other"}
+	byGroup := make(map[string][]string)
+	for _, k := range keys {
+		g := displayGroup(k)
+		byGroup[g] = append(byGroup[g], k)
 	}
-	fmt.Fprintf(w, "Total: %d resources cleaned\n", total)
+
+	fmt.Fprintf(w, "# CRD resource summary (created)\n\n")
+	fmt.Fprintf(w, "| Resource type | Count | Avg CPU | Avg memory |\n")
+	fmt.Fprintf(w, "|---------------|-------|---------|------------|\n")
+
+	var totalCount int
+	var totalCPUMillis, totalMemMB int64
+	var withResourceInfo int
+
+	for _, group := range groupOrder {
+		for _, key := range byGroup[group] {
+			st := h.CRDCreationStats[key]
+			if st == nil {
+				continue
+			}
+			totalCount += st.Count
+			totalCPUMillis += st.TotalCPUMillis
+			totalMemMB += st.TotalMemMB
+			withResourceInfo += st.WithResourceInfo
+
+			avgCPU := "-"
+			if st.WithResourceInfo > 0 && st.TotalCPUMillis > 0 {
+				avgM := st.TotalCPUMillis / int64(st.WithResourceInfo)
+				if avgM >= 1000 {
+					avgCPU = fmt.Sprintf("%.1f cores", float64(avgM)/1000)
+				} else {
+					avgCPU = fmt.Sprintf("%dm", avgM)
+				}
+			}
+			avgMem := "-"
+			if st.WithResourceInfo > 0 && st.TotalMemMB > 0 {
+				avgMB := st.TotalMemMB / int64(st.WithResourceInfo)
+				if avgMB >= 1024 {
+					avgMem = fmt.Sprintf("%.1f GiB", float64(avgMB)/1024)
+				} else {
+					avgMem = fmt.Sprintf("%d MiB", avgMB)
+				}
+			}
+			fmt.Fprintf(w, "| %s | %d | %s | %s |\n", key, st.Count, avgCPU, avgMem)
+		}
+	}
+
+	fmt.Fprintf(w, "| **Total** | **%d** | ", totalCount)
+	if withResourceInfo > 0 && totalCPUMillis > 0 {
+		avgM := totalCPUMillis / int64(withResourceInfo)
+		if avgM >= 1000 {
+			fmt.Fprintf(w, "**%.1f cores** | ", float64(avgM)/1000)
+		} else {
+			fmt.Fprintf(w, "**%dm** | ", avgM)
+		}
+	} else {
+		fmt.Fprintf(w, "- | ")
+	}
+	if withResourceInfo > 0 && totalMemMB > 0 {
+		avgMB := totalMemMB / int64(withResourceInfo)
+		if avgMB >= 1024 {
+			fmt.Fprintf(w, "**%.1f GiB** |\n", float64(avgMB)/1024)
+		} else {
+			fmt.Fprintf(w, "**%d MiB** |\n", avgMB)
+		}
+	} else {
+		fmt.Fprintf(w, "- |\n")
+	}
+}
+
+// PrintCRDCleanupSummaryTable writes the CRD creation summary as an ASCII table to w (for CLI display).
+func (h *Healer) PrintCRDCleanupSummaryTable(w io.Writer) {
+	h.crdCreationStatsMu.RLock()
+	defer h.crdCreationStatsMu.RUnlock()
+
+	headerResource := "Resource type"
+	headerCount := "Count"
+	headerCPU := "Avg CPU"
+	headerMem := "Avg memory"
+
+	if len(h.CRDCreationStats) == 0 {
+		fmt.Fprintf(w, "CRD resource summary (created)\n\n")
+		fmt.Fprintf(w, "  %s\n\n", "0 resources created (no creations yet).")
+		return
+	}
+
+	keys := make([]string, 0, len(h.CRDCreationStats))
+	for k := range h.CRDCreationStats {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	groupOrder := []string{"VM", "CDI", "Snapshot / Clone", "Instance type", "Migration", "Network", "Template", "Other"}
+	byGroup := make(map[string][]string)
+	for _, k := range keys {
+		byGroup[displayGroup(k)] = append(byGroup[displayGroup(k)], k)
+	}
+
+	type row struct{ resource, count, cpu, mem string }
+	var rows []row
+	var totalCount int
+	var totalCPUMillis, totalMemMB int64
+	var withResourceInfo int
+
+	for _, group := range groupOrder {
+		for _, key := range byGroup[group] {
+			st := h.CRDCreationStats[key]
+			if st == nil {
+				continue
+			}
+			totalCount += st.Count
+			totalCPUMillis += st.TotalCPUMillis
+			totalMemMB += st.TotalMemMB
+			withResourceInfo += st.WithResourceInfo
+			avgCPU := "-"
+			if st.WithResourceInfo > 0 && st.TotalCPUMillis > 0 {
+				avgM := st.TotalCPUMillis / int64(st.WithResourceInfo)
+				if avgM >= 1000 {
+					avgCPU = fmt.Sprintf("%.1f cores", float64(avgM)/1000)
+				} else {
+					avgCPU = fmt.Sprintf("%dm", avgM)
+				}
+			}
+			avgMem := "-"
+			if st.WithResourceInfo > 0 && st.TotalMemMB > 0 {
+				avgMB := st.TotalMemMB / int64(st.WithResourceInfo)
+				if avgMB >= 1024 {
+					avgMem = fmt.Sprintf("%.1f GiB", float64(avgMB)/1024)
+				} else {
+					avgMem = fmt.Sprintf("%d MiB", avgMB)
+				}
+			}
+			rows = append(rows, row{key, fmt.Sprintf("%d", st.Count), avgCPU, avgMem})
+		}
+	}
+
+	totalCPU := "-"
+	totalMem := "-"
+	if withResourceInfo > 0 && totalCPUMillis > 0 {
+		avgM := totalCPUMillis / int64(withResourceInfo)
+		if avgM >= 1000 {
+			totalCPU = fmt.Sprintf("%.1f cores", float64(avgM)/1000)
+		} else {
+			totalCPU = fmt.Sprintf("%dm", avgM)
+		}
+	}
+	if withResourceInfo > 0 && totalMemMB > 0 {
+		avgMB := totalMemMB / int64(withResourceInfo)
+		if avgMB >= 1024 {
+			totalMem = fmt.Sprintf("%.1f GiB", float64(avgMB)/1024)
+		} else {
+			totalMem = fmt.Sprintf("%d MiB", avgMB)
+		}
+	}
+	rows = append(rows, row{"Total", fmt.Sprintf("%d", totalCount), totalCPU, totalMem})
+
+	wResource := len(headerResource)
+	wCount := len(headerCount)
+	wCPU := len(headerCPU)
+	wMem := len(headerMem)
+	for _, r := range rows {
+		if len(r.resource) > wResource {
+			wResource = len(r.resource)
+		}
+		if len(r.count) > wCount {
+			wCount = len(r.count)
+		}
+		if len(r.cpu) > wCPU {
+			wCPU = len(r.cpu)
+		}
+		if len(r.mem) > wMem {
+			wMem = len(r.mem)
+		}
+	}
+
+	pad := func(s string, n int) string {
+		if len(s) >= n {
+			return s
+		}
+		return s + strings.Repeat(" ", n-len(s))
+	}
+	sep := "+-" + strings.Repeat("-", wResource) + "-+-" + strings.Repeat("-", wCount) + "-+-" + strings.Repeat("-", wCPU) + "-+-" + strings.Repeat("-", wMem) + "-+\n"
+	fmt.Fprint(w, "CRD resource summary (created)\n\n")
+	fmt.Fprint(w, sep)
+	fmt.Fprintf(w, "| %s | %s | %s | %s |\n", pad(headerResource, wResource), pad(headerCount, wCount), pad(headerCPU, wCPU), pad(headerMem, wMem))
+	fmt.Fprint(w, sep)
+	for i, r := range rows {
+		line := "| " + pad(r.resource, wResource) + " | " + pad(r.count, wCount) + " | " + pad(r.cpu, wCPU) + " | " + pad(r.mem, wMem) + " |\n"
+		fmt.Fprint(w, line)
+		if i == len(rows)-2 {
+			fmt.Fprint(w, sep)
+		}
+	}
+	fmt.Fprint(w, sep)
+}
+
+// CRDSummaryRow is one row in the JSON summary (per resource type or total).
+type CRDSummaryRow struct {
+	ResourceType string `json:"resource_type"`
+	Count        int    `json:"count"`
+	AvgCPU       string `json:"avg_cpu,omitempty"`
+	AvgMemory    string `json:"avg_memory,omitempty"`
+}
+
+// CRDSummaryJSON is the root structure for the JSON summary output.
+type CRDSummaryJSON struct {
+	Title   string          `json:"title"`
+	Summary []CRDSummaryRow `json:"summary"`
+	Total   CRDSummaryRow   `json:"total"`
+}
+
+// PrintCRDCleanupSummaryToJSON writes the CRD creation summary as JSON to w (same data as markdown, machine-readable).
+func (h *Healer) PrintCRDCleanupSummaryToJSON(w io.Writer) error {
+	h.crdCreationStatsMu.RLock()
+	defer h.crdCreationStatsMu.RUnlock()
+	out := CRDSummaryJSON{Title: "CRD resource summary (created)"}
+	if len(h.CRDCreationStats) == 0 {
+		out.Summary = []CRDSummaryRow{}
+		out.Total = CRDSummaryRow{ResourceType: "Total", Count: 0}
+		return json.NewEncoder(w).Encode(out)
+	}
+	keys := make([]string, 0, len(h.CRDCreationStats))
+	for k := range h.CRDCreationStats {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	groupOrder := []string{"VM", "CDI", "Snapshot / Clone", "Instance type", "Migration", "Network", "Template", "Other"}
+	byGroup := make(map[string][]string)
+	for _, k := range keys {
+		byGroup[displayGroup(k)] = append(byGroup[displayGroup(k)], k)
+	}
+	var totalCount int
+	var totalCPUMillis, totalMemMB int64
+	var withResourceInfo int
+	for _, group := range groupOrder {
+		for _, key := range byGroup[group] {
+			st := h.CRDCreationStats[key]
+			if st == nil {
+				continue
+			}
+			totalCount += st.Count
+			totalCPUMillis += st.TotalCPUMillis
+			totalMemMB += st.TotalMemMB
+			withResourceInfo += st.WithResourceInfo
+			row := CRDSummaryRow{ResourceType: key, Count: st.Count}
+			if st.WithResourceInfo > 0 && st.TotalCPUMillis > 0 {
+				avgM := st.TotalCPUMillis / int64(st.WithResourceInfo)
+				if avgM >= 1000 {
+					row.AvgCPU = fmt.Sprintf("%.1f cores", float64(avgM)/1000)
+				} else {
+					row.AvgCPU = fmt.Sprintf("%dm", avgM)
+				}
+			}
+			if st.WithResourceInfo > 0 && st.TotalMemMB > 0 {
+				avgMB := st.TotalMemMB / int64(st.WithResourceInfo)
+				if avgMB >= 1024 {
+					row.AvgMemory = fmt.Sprintf("%.1f GiB", float64(avgMB)/1024)
+				} else {
+					row.AvgMemory = fmt.Sprintf("%d MiB", avgMB)
+				}
+			}
+			out.Summary = append(out.Summary, row)
+		}
+	}
+	out.Total = CRDSummaryRow{ResourceType: "Total", Count: totalCount}
+	if withResourceInfo > 0 && totalCPUMillis > 0 {
+		avgM := totalCPUMillis / int64(withResourceInfo)
+		if avgM >= 1000 {
+			out.Total.AvgCPU = fmt.Sprintf("%.1f cores", float64(avgM)/1000)
+		} else {
+			out.Total.AvgCPU = fmt.Sprintf("%dm", avgM)
+		}
+	}
+	if withResourceInfo > 0 && totalMemMB > 0 {
+		avgMB := totalMemMB / int64(withResourceInfo)
+		if avgMB >= 1024 {
+			out.Total.AvgMemory = fmt.Sprintf("%.1f GiB", float64(avgMB)/1024)
+		} else {
+			out.Total.AvgMemory = fmt.Sprintf("%d MiB", avgMB)
+		}
+	}
+	return json.NewEncoder(w).Encode(out)
 }
 
 // watchResourceOptimization periodically checks cluster resource strain and optimizes pods

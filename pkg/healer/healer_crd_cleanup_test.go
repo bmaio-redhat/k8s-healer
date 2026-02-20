@@ -3,6 +3,7 @@ package healer
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -139,10 +140,14 @@ func TestHealer_DoCRDCleanup_Success(t *testing.T) {
 	}
 	// Successful delete should have recorded cleanup count
 	healer.crdCleanupCountsMu.RLock()
-	count := healer.CRDCleanupCounts["virtualmachines.kubevirt.io/v1"]
+	st := healer.CRDCleanupStats["virtualmachines.kubevirt.io/v1"]
 	healer.crdCleanupCountsMu.RUnlock()
-	if count != 1 {
-		t.Errorf("CRDCleanupCounts[virtualmachines.kubevirt.io/v1] = %d, want 1", count)
+	if st == nil || st.Count != 1 {
+		count := 0
+		if st != nil {
+			count = st.Count
+		}
+		t.Errorf("CRDCleanupStats[virtualmachines.kubevirt.io/v1].Count = %d, want 1", count)
 	}
 }
 
@@ -203,17 +208,25 @@ func TestHealer_RecordCRDCleanup(t *testing.T) {
 	gvr1 := schema.GroupVersionResource{Group: "kubevirt.io", Version: "v1", Resource: "virtualmachines"}
 	gvr2 := schema.GroupVersionResource{Group: "cdi.kubevirt.io", Version: "v1beta1", Resource: "datavolumes"}
 
-	healer.RecordCRDCleanup(gvr1)
-	healer.RecordCRDCleanup(gvr1)
-	healer.RecordCRDCleanup(gvr2)
+	healer.RecordCRDCleanup(nil, gvr1)
+	healer.RecordCRDCleanup(nil, gvr1)
+	healer.RecordCRDCleanup(nil, gvr2)
 
 	healer.crdCleanupCountsMu.RLock()
 	defer healer.crdCleanupCountsMu.RUnlock()
-	if got := healer.CRDCleanupCounts["virtualmachines.kubevirt.io/v1"]; got != 2 {
-		t.Errorf("CRDCleanupCounts[virtualmachines.kubevirt.io/v1] = %d, want 2", got)
+	if got := healer.CRDCleanupStats["virtualmachines.kubevirt.io/v1"]; got == nil || got.Count != 2 {
+		count := 0
+		if got != nil {
+			count = got.Count
+		}
+		t.Errorf("CRDCleanupStats[virtualmachines.kubevirt.io/v1].Count = %d, want 2", count)
 	}
-	if got := healer.CRDCleanupCounts["datavolumes.cdi.kubevirt.io/v1beta1"]; got != 1 {
-		t.Errorf("CRDCleanupCounts[datavolumes.cdi.kubevirt.io/v1beta1] = %d, want 1", got)
+	if got := healer.CRDCleanupStats["datavolumes.cdi.kubevirt.io/v1beta1"]; got == nil || got.Count != 1 {
+		count := 0
+		if got != nil {
+			count = got.Count
+		}
+		t.Errorf("CRDCleanupStats[datavolumes.cdi.kubevirt.io/v1beta1].Count = %d, want 1", count)
 	}
 }
 
@@ -222,17 +235,53 @@ func TestHealer_RecordCRDCleanup_NilMap(t *testing.T) {
 	if err != nil {
 		t.Fatalf("createTestHealer() error = %v", err)
 	}
-	healer.CRDCleanupCounts = nil
+	healer.CRDCleanupStats = nil
 
-	healer.RecordCRDCleanup(schema.GroupVersionResource{Group: "kubevirt.io", Version: "v1", Resource: "virtualmachines"})
+	healer.RecordCRDCleanup(nil, schema.GroupVersionResource{Group: "kubevirt.io", Version: "v1", Resource: "virtualmachines"})
 
 	healer.crdCleanupCountsMu.RLock()
 	defer healer.crdCleanupCountsMu.RUnlock()
-	if healer.CRDCleanupCounts == nil {
-		t.Fatal("RecordCRDCleanup should initialize CRDCleanupCounts when nil")
+	if healer.CRDCleanupStats == nil {
+		t.Fatal("RecordCRDCleanup should initialize CRDCleanupStats when nil")
 	}
-	if got := healer.CRDCleanupCounts["virtualmachines.kubevirt.io/v1"]; got != 1 {
-		t.Errorf("CRDCleanupCounts[virtualmachines.kubevirt.io/v1] = %d, want 1", got)
+	if got := healer.CRDCleanupStats["virtualmachines.kubevirt.io/v1"]; got == nil || got.Count != 1 {
+		count := 0
+		if got != nil {
+			count = got.Count
+		}
+		t.Errorf("CRDCleanupStats[virtualmachines.kubevirt.io/v1].Count = %d, want 1", count)
+	}
+}
+
+func TestHealer_RecordCRDCreation(t *testing.T) {
+	healer, err := createTestHealer([]string{"default"})
+	if err != nil {
+		t.Fatalf("createTestHealer() error = %v", err)
+	}
+
+	gvr1 := schema.GroupVersionResource{Group: "kubevirt.io", Version: "v1", Resource: "virtualmachines"}
+	gvr2 := schema.GroupVersionResource{Group: "cdi.kubevirt.io", Version: "v1beta1", Resource: "datavolumes"}
+	res := &unstructured.Unstructured{Object: map[string]interface{}{"metadata": map[string]interface{}{"name": "vm1", "namespace": "default"}}}
+
+	healer.RecordCRDCreation(res, gvr1)
+	healer.RecordCRDCreation(res, gvr1)
+	healer.RecordCRDCreation(res, gvr2)
+
+	healer.crdCreationStatsMu.RLock()
+	defer healer.crdCreationStatsMu.RUnlock()
+	if got := healer.CRDCreationStats["virtualmachines.kubevirt.io/v1"]; got == nil || got.Count != 2 {
+		count := 0
+		if got != nil {
+			count = got.Count
+		}
+		t.Errorf("CRDCreationStats[virtualmachines.kubevirt.io/v1].Count = %d, want 2", count)
+	}
+	if got := healer.CRDCreationStats["datavolumes.cdi.kubevirt.io/v1beta1"]; got == nil || got.Count != 1 {
+		count := 0
+		if got != nil {
+			count = got.Count
+		}
+		t.Errorf("CRDCreationStats[datavolumes.cdi.kubevirt.io/v1beta1].Count = %d, want 1", count)
 	}
 }
 
@@ -242,7 +291,7 @@ func TestHealer_PrintCRDCleanupSummary(t *testing.T) {
 		t.Fatalf("createTestHealer() error = %v", err)
 	}
 
-	// Empty summary
+	// Empty summary (creation-based)
 	old := os.Stdout
 	r, w, err := os.Pipe()
 	if err != nil {
@@ -255,15 +304,18 @@ func TestHealer_PrintCRDCleanupSummary(t *testing.T) {
 	io.Copy(&buf, r)
 	os.Stdout = old
 	out := buf.String()
-	if !strings.Contains(out, "0 resources cleaned") {
-		t.Errorf("PrintCRDCleanupSummary() empty output should mention no cleanups; got %q", out)
+	if !strings.Contains(out, "0 resources created") {
+		t.Errorf("PrintCRDCleanupSummary() empty output should mention no creations; got %q", out)
+	}
+	if !strings.Contains(out, "CRD resource summary (created)") {
+		t.Errorf("PrintCRDCleanupSummary() should output creation summary title; got %q", out)
 	}
 
-	// Non-empty summary
-	healer.crdCleanupCountsMu.Lock()
-	healer.CRDCleanupCounts["virtualmachines.kubevirt.io/v1"] = 3
-	healer.CRDCleanupCounts["datavolumes.cdi.kubevirt.io/v1beta1"] = 2
-	healer.crdCleanupCountsMu.Unlock()
+	// Non-empty summary (creation stats, ASCII table)
+	healer.crdCreationStatsMu.Lock()
+	healer.CRDCreationStats["virtualmachines.kubevirt.io/v1"] = &CRDCreationStats{Count: 3}
+	healer.CRDCreationStats["datavolumes.cdi.kubevirt.io/v1beta1"] = &CRDCreationStats{Count: 2}
+	healer.crdCreationStatsMu.Unlock()
 
 	r2, w2, _ := os.Pipe()
 	os.Stdout = w2
@@ -273,14 +325,107 @@ func TestHealer_PrintCRDCleanupSummary(t *testing.T) {
 	io.Copy(&buf2, r2)
 	os.Stdout = old
 	out2 := buf2.String()
-	if !strings.Contains(out2, "virtualmachines.kubevirt.io/v1: 3") {
-		t.Errorf("PrintCRDCleanupSummary() should list virtualmachines count; got %q", out2)
+	if !strings.Contains(out2, "CRD resource summary (created)") {
+		t.Errorf("PrintCRDCleanupSummary() should output creation summary title; got %q", out2)
 	}
-	if !strings.Contains(out2, "datavolumes.cdi.kubevirt.io/v1beta1: 2") {
-		t.Errorf("PrintCRDCleanupSummary() should list datavolumes count; got %q", out2)
+	if !strings.Contains(out2, "virtualmachines.kubevirt.io/v1") || !strings.Contains(out2, "3") {
+		t.Errorf("PrintCRDCleanupSummary() should list virtualmachines count in table; got %q", out2)
 	}
-	if !strings.Contains(out2, "Total: 5 resources cleaned") {
-		t.Errorf("PrintCRDCleanupSummary() should show total 5; got %q", out2)
+	if !strings.Contains(out2, "datavolumes.cdi.kubevirt.io/v1beta1") || !strings.Contains(out2, "2") {
+		t.Errorf("PrintCRDCleanupSummary() should list datavolumes count in table; got %q", out2)
+	}
+	if !strings.Contains(out2, "Total") || !strings.Contains(out2, "5") {
+		t.Errorf("PrintCRDCleanupSummary() should show total 5 in table; got %q", out2)
+	}
+	if !strings.Contains(out2, "+-") {
+		t.Errorf("PrintCRDCleanupSummary() should output ASCII table; got %q", out2)
+	}
+}
+
+func TestHealer_PrintCRDCleanupSummaryTable(t *testing.T) {
+	healer, err := createTestHealer([]string{"default"})
+	if err != nil {
+		t.Fatalf("createTestHealer() error = %v", err)
+	}
+	var buf bytes.Buffer
+	healer.PrintCRDCleanupSummaryTable(&buf)
+	out := buf.String()
+	if !strings.Contains(out, "CRD resource summary (created)") {
+		t.Errorf("PrintCRDCleanupSummaryTable() should include title; got %q", out)
+	}
+	if !strings.Contains(out, "0 resources created") {
+		t.Errorf("PrintCRDCleanupSummaryTable() empty should mention 0 creations; got %q", out)
+	}
+
+	healer.crdCreationStatsMu.Lock()
+	healer.CRDCreationStats["virtualmachines.kubevirt.io/v1"] = &CRDCreationStats{Count: 2}
+	healer.crdCreationStatsMu.Unlock()
+	buf.Reset()
+	healer.PrintCRDCleanupSummaryTable(&buf)
+	out = buf.String()
+	if !strings.Contains(out, "+-") || !strings.Contains(out, "Resource type") {
+		t.Errorf("PrintCRDCleanupSummaryTable() should output ASCII table; got %q", out)
+	}
+	if !strings.Contains(out, "Total") || !strings.Contains(out, "2") {
+		t.Errorf("PrintCRDCleanupSummaryTable() should show total 2; got %q", out)
+	}
+}
+
+func TestHealer_PrintCRDCleanupSummaryToJSON(t *testing.T) {
+	healer, err := createTestHealer([]string{"default"})
+	if err != nil {
+		t.Fatalf("createTestHealer() error = %v", err)
+	}
+
+	// Empty summary
+	var buf bytes.Buffer
+	if err := healer.PrintCRDCleanupSummaryToJSON(&buf); err != nil {
+		t.Fatalf("PrintCRDCleanupSummaryToJSON() error = %v", err)
+	}
+	var out CRDSummaryJSON
+	if err := json.Unmarshal(buf.Bytes(), &out); err != nil {
+		t.Fatalf("JSON unmarshal: %v", err)
+	}
+	if out.Title != "CRD resource summary (created)" {
+		t.Errorf("Title = %q, want CRD resource summary (created)", out.Title)
+	}
+	if out.Total.Count != 0 {
+		t.Errorf("Total.Count = %d, want 0", out.Total.Count)
+	}
+	if len(out.Summary) != 0 {
+		t.Errorf("len(Summary) = %d, want 0", len(out.Summary))
+	}
+
+	// Non-empty summary (same data as table test)
+	healer.crdCreationStatsMu.Lock()
+	healer.CRDCreationStats["virtualmachines.kubevirt.io/v1"] = &CRDCreationStats{Count: 3}
+	healer.CRDCreationStats["datavolumes.cdi.kubevirt.io/v1beta1"] = &CRDCreationStats{Count: 2}
+	healer.crdCreationStatsMu.Unlock()
+
+	buf.Reset()
+	if err := healer.PrintCRDCleanupSummaryToJSON(&buf); err != nil {
+		t.Fatalf("PrintCRDCleanupSummaryToJSON() error = %v", err)
+	}
+	if err := json.Unmarshal(buf.Bytes(), &out); err != nil {
+		t.Fatalf("JSON unmarshal: %v", err)
+	}
+	if out.Total.Count != 5 {
+		t.Errorf("Total.Count = %d, want 5", out.Total.Count)
+	}
+	if len(out.Summary) != 2 {
+		t.Errorf("len(Summary) = %d, want 2", len(out.Summary))
+	}
+	var seenVM, seenDV bool
+	for _, row := range out.Summary {
+		if row.ResourceType == "virtualmachines.kubevirt.io/v1" && row.Count == 3 {
+			seenVM = true
+		}
+		if row.ResourceType == "datavolumes.cdi.kubevirt.io/v1beta1" && row.Count == 2 {
+			seenDV = true
+		}
+	}
+	if !seenVM || !seenDV {
+		t.Errorf("Summary missing expected rows; got %+v", out.Summary)
 	}
 }
 
